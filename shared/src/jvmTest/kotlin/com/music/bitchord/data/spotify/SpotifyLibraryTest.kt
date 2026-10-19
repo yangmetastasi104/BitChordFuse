@@ -5,6 +5,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class SpotifyLibraryTest {
     private val json = Json { ignoreUnknownKeys = true }
@@ -64,5 +65,96 @@ class SpotifyLibraryTest {
         assertNull(SpotifyImporter.extractPlaylistId("ftp://open.spotify.com/playlist/$id"))
         assertNull(SpotifyImporter.extractPlaylistId("https://open.spotify.com/playlist/short"))
         assertNull(SpotifyImporter.extractPlaylistId(""))
+    }
+
+    @Test
+    fun featuredPlaylistsParse() {
+        val root = json.parseToJsonElement(
+            """
+            {"playlists":{"items":[
+              {"id":"37i9dQZF1DXcBWIGoYBM5M","name":"Today's Top Hits",
+               "owner":{"display_name":"Spotify"},
+               "images":[{"url":"https://i.scdn.co/big"},{"url":"https://i.scdn.co/small"}]},
+              {"id":"37i9dQZF1DWXRqz3211m","name":"RapCaviar",
+               "owner":{"display_name":"Spotify"},"images":[]},
+              {"name":"Nameless"}
+            ]}}
+            """.trimIndent(),
+        ).jsonObject
+        val items = parseFeaturedPlaylists(root)
+        assertEquals(2, items.size)
+        assertEquals("37i9dQZF1DXcBWIGoYBM5M", items[0].id)
+        assertEquals("Today's Top Hits", items[0].name)
+        assertEquals("Spotify", items[0].owner)
+        assertEquals("https://i.scdn.co/big", items[0].imageUrl)
+        assertEquals("RapCaviar", items[1].name)
+    }
+
+    @Test
+    fun topTracksParse() {        val root = json.parseToJsonElement(
+            """
+            {"items":[
+              {"id":"t1","name":"Song","artists":[{"name":"Artist"}],
+               "album":{"name":"Album","images":[{"url":"https://img"}]},
+               "duration_ms":200000},
+              {"name":"Nameless"}
+            ]}
+            """.trimIndent(),
+        ).jsonObject
+        val items = parseTopTracks(root)
+        assertEquals(1, items.size)
+        assertEquals("t1", items[0].id)
+        assertEquals("Song", items[0].title)
+        assertEquals("Artist", items[0].artist)
+        assertEquals("Album", items[0].album)
+        assertEquals(200000, items[0].durationMs)
+        assertEquals("https://img", items[0].imageUrl)
+    }
+
+    @Test
+    fun rateLimitDelayHonorsServerValue() {
+        assertEquals(0L, rateLimitDelayMs(0L, 0))
+        assertEquals(5000L, rateLimitDelayMs(5L, 0))
+        assertEquals(30000L, rateLimitDelayMs(120L, 0))
+    }
+
+    @Test
+    fun rateLimitDelayBacksOffWithoutHeader() {
+        assertEquals(1000L, rateLimitDelayMs(null, 0))
+        assertEquals(2000L, rateLimitDelayMs(null, 1))
+        assertEquals(30000L, rateLimitDelayMs(null, 99))
+    }
+
+    @Test
+    fun retrySucceedsAfterRateLimits() = kotlinx.coroutines.runBlocking {
+        var calls = 0
+        val result = withRateLimitRetry {
+            calls++
+            if (calls < 3) throw SpotifyRateLimitedException(0L)
+            "ok"
+        }
+        assertEquals("ok", result)
+        assertEquals(3, calls)
+    }
+
+    @Test
+    fun retryGivesUpAfterMaxAttempts() = kotlinx.coroutines.runBlocking {
+        var calls = 0
+        val failure = runCatching {
+            withRateLimitRetry(maxAttempts = 2) {
+                calls++
+                throw SpotifyRateLimitedException(0L)
+            }
+        }.exceptionOrNull()
+        assertTrue(failure is SpotifyRateLimitedException)
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun retryPassesOtherErrorsThrough() = kotlinx.coroutines.runBlocking {
+        val failure = runCatching {
+            withRateLimitRetry { throw IllegalStateException("nope") }
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
     }
 }

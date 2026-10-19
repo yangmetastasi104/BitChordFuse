@@ -85,7 +85,7 @@ sealed interface StreamRequest {
  * people to re-type a password that was never wrong.
  */
 sealed interface SourceHealth {
-    data class Ok(val detail: String? = null) : SourceHealth
+    data class Ok(val detail: String? = null, val latencyMs: Long? = null) : SourceHealth
     data class Unreachable(val reason: String) : SourceHealth
     data class Rejected(val reason: String) : SourceHealth
 
@@ -118,6 +118,23 @@ interface MusicSource {
 
     /** What the user named it, falling back to the server's own hostname. */
     val displayName: String
+
+    /**
+     * What this source honestly supports. Defaults to full playback so
+     * existing implementations keep working; metadata-only sources
+     * (Spotify) must override with [ProviderCapabilities.METADATA_ONLY].
+     */
+    val capabilities: ProviderCapabilities
+        get() = ProviderCapabilities.ADDON_DEFAULT
+
+    /**
+     * Stable id prefix this source's tracks carry (e.g. `spotify:track:`),
+     * or null when it uses [SourceRegistry.trackKey] / bare YouTube ids.
+     * Used to pin direct-id resolution the way MetroFuse pins
+     * `tidal:track:`/`deezer:track:` ids in `MusicService`.
+     */
+    val idPrefix: String?
+        get() = null
 
     /** Reachability and credentials, for the sources screen and for skipping dead sources. */
     suspend fun health(): SourceHealth

@@ -74,15 +74,12 @@ data class SourceConfig(
 }
 
 /**
- * The user's sources, always tried in the fixed order [SourceKind] declares:
- * their own addons first, then JioSaavn, then YouTube Music.
+ * The user's sources: their own addons first, then JioSaavn, then the
+ * YouTube Music catalog.
  *
- * [SourceKind.YOUTUBE] is seeded on first run and cannot be deleted, only
- * disabled — it needs no configuration, so a "remove" would delete something
- * the user could not then re-create by typing anything in, it would just be a
- * switch that hides itself. Addons are entirely optional: with none
- * configured, YouTube is the only active source on a fresh install. JioSaavn
- * is present but off until the user accepts its catalogue-matching risk.
+ * YouTube Music contributes metadata only (search/browse/library); it never
+ * serves audio. [activeForPlayback] and [activeForDownload] exclude it —
+ * see [SourceKind.YOUTUBE] — while [activeForCatalog] includes it.
  */
 object SourceRegistry {
 
@@ -139,7 +136,7 @@ object SourceRegistry {
     ): List<SourceConfig> {
         // Seeded rather than persisted-on-first-write, so a build adding a new
         // built-in kind picks it up for existing installs too. SourceConfig's
-        // default is the policy: JioSaavn off, YouTube on.
+        // default is the policy: JioSaavn off, YouTube catalog on.
         val seeded = stored + BUILT_IN_KINDS
             .filter { kind -> stored.none { it.kind == kind } }
             .map { SourceConfig(kind = it) }
@@ -150,7 +147,6 @@ object SourceRegistry {
             .filterNot { it.kind == SourceKind.MODULE }
             .map { config ->
                 when {
-                    config.kind == SourceKind.YOUTUBE && !config.enabled -> config.copy(enabled = true)
                     config.kind == SourceKind.JIOSAAVN && forceJioSaavnOff -> config.copy(enabled = false)
                     else -> config
                 }
@@ -193,11 +189,13 @@ object SourceRegistry {
             .mapNotNull { instances[it.id] }
 
     /**
-     * [active], minus the addons whose manifest said `allowDownloads: 0`. A
-     * download walks this instead, so the next source in line serves it.
+     * [active], minus the addons whose manifest said `allowDownloads: 0` and
+     * minus the catalog-only YouTube Music source, which holds no audio to
+     * file. A download walks this instead, so the next source in line serves
+     * it.
      */
     fun activeForDownload(): List<MusicSource> =
-        active().filter { config(it.configId)?.allowDownloads != false }
+        active().filter { it.kind != SourceKind.YOUTUBE && config(it.configId)?.allowDownloads != false }
 
     /**
      * Records what an addon's manifest said about downloads and lossless
@@ -228,7 +226,8 @@ object SourceRegistry {
 
     /**
      * [active], minus the sources the ceiling on the connection in hand does
-     * not pay for — see [AudioQuality.permits].
+     * not pay for — see [AudioQuality.permits] — and minus the catalog-only
+     * YouTube Music source, which never serves audio.
      *
      * Every path that starts or plans a *stream* asks this rather than
      * [active], so the Wi-Fi and mobile-data rungs stay two independent
@@ -240,8 +239,15 @@ object SourceRegistry {
      */
     fun activeForPlayback(): List<MusicSource> {
         val ceiling = AppSettings.effectiveAudioQuality
-        return active().filter { ceiling.permits(it.kind) }
+        return active().filter { it.kind != SourceKind.YOUTUBE && ceiling.permits(it.kind) }
     }
+
+    /**
+     * The enabled sources that may contribute catalog results (search, home,
+     * library metadata) — including the catalog-only YouTube Music source.
+     * Audio never comes from this list; see [activeForPlayback].
+     */
+    fun activeForCatalog(): List<MusicSource> = active()
 
     fun instance(configId: String): MusicSource? = instances[configId]
 
@@ -293,19 +299,32 @@ object SourceRegistry {
     }
 
     /**
-     * Turns one source on or off.
-     *
-     * YouTube is not switchable and silently ignores a request to disable it.
-     * It is the only source that can supply a home feed, radio or related
-     * tracks, and nothing else holds the full catalogue — switching it off
-     * doesn't even stop it being played, because a YouTube-queued track whose
-     * substitutes all miss still falls back to it. A switch that cannot honour
-     * its own off position is worse than no switch, so it isn't offered one:
-     * see [SourcesScreen][com.music.bitchord.ui.screens.SourcesScreen].
+     * Turns one source on or off. For YouTube Music this toggles catalog
+     * participation (search/home/library metadata); it never served audio in
+     * this build, so there is no fallback to lose. With every audio source
+     * off, playback reports an explicit "no enabled source" error.
      */
     fun setEnabled(configId: String, enabled: Boolean) {
-        if (!enabled && config(configId)?.kind == SourceKind.YOUTUBE) return
         publish(configs.value.map { if (it.id == configId) it.copy(enabled = enabled) else it })
+    }
+
+    /**
+     * Health of a stored config with a latency measurement, MetroFuse
+     * `ProviderHealthChecker` equivalent. Does not throw; transport failures
+     * map to [SourceHealth.Unreachable] with the elapsed time dropped.
+     */
+    suspend fun healthOf(configId: String): SourceHealth {
+        val config = config(configId) ?: return SourceHealth.Unreachable("Not configured")
+        val start = android.os.SystemClock.elapsedRealtime()
+        return try {
+            when (val h = probeCandidate(config)) {
+                is SourceHealth.Ok ->
+                    h.copy(latencyMs = android.os.SystemClock.elapsedRealtime() - start)
+                else -> h
+            }
+        } catch (e: Exception) {
+            SourceHealth.Unreachable(e.message ?: "Probe failed")
+        }
     }
 
     /**

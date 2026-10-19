@@ -44,3 +44,7 @@ keystore.properties
 # AI agent configuration
 AGENTS.md
 /output/
+
+# Local release APKs (large binaries; GitHub rejects files >100MB). Rebuild with :app:assembleProdRelease
+apk/
+

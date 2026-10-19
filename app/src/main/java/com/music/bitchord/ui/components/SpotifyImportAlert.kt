@@ -44,7 +44,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /**
- * Paste a Spotify playlist link, match its songs on YouTube Music, keep the result.
+ * Paste a Spotify playlist link, match its songs against the enabled provider
+ * sources, keep the result.
  *
  * The same frosted card as the addon editor, rather than a Material dialog.
  * The "who can see it" row exists only for [signedIn]: it is a YouTube Music
@@ -83,8 +84,21 @@ fun SpotifyImportAlert(
         scope.launch {
             try {
                 val (name, tracks) = SpotifyImporter.fetchPlaylistTracks(id)
-                val (songs, missed) = SpotifyImporter.resolveToSongs(tracks) { done, total ->
-                    status = context.getString(R.string.spotify_import_matching, done, total)
+                // Matched against the enabled provider sources (no YouTube
+                // Music): each import row becomes a playable provider row, or
+                // is reported as unmatched below.
+                val songs = mutableListOf<Song>()
+                val missed = mutableListOf<SpotifyImportTrack>()
+                tracks.forEachIndexed { index, track ->
+                    status = context.getString(R.string.spotify_import_matching, index + 1, tracks.size)
+                    val target = com.music.bitchord.data.sources.TrackMatcher.Target(
+                        title = track.title,
+                        artist = track.artist,
+                    )
+                    val match = runCatching {
+                        com.music.bitchord.data.sources.SourceResolver.matchRow(target)
+                    }.getOrNull()
+                    if (match != null) songs += match else missed += track
                 }
                 if (songs.isEmpty()) error(context.getString(R.string.spotify_import_none))
                 onImported(name, privacy, songs)

@@ -34,7 +34,7 @@ object AndroidStreamHooks {
             }
         }
         TrackLog.sourcesLine = {
-            "sources: substitution=${SourceResolver.canSubstituteForYouTube()} " +
+            "sources: substitution=${SourceResolver.canSubstitute()} " +
                 "request=${SourceResolver.requestForNow()}"
         }
         TrackLog.headerLines = {
@@ -49,6 +49,10 @@ object AndroidStreamHooks {
 
     /** What `InnerTubeXResolver.init(context)` did when it lived in the app. */
     fun initInnerTubeX(context: Context) {
+        // Never initialized in this build: InnerTubeX warmup (player-config
+        // fetch, YouTube JS, BotGuard minting) is YouTube Music traffic.
+        // Kept for API compatibility; calling it is a no-op.
+        if (com.music.bitchord.data.innertube.YtmNetwork.isPlaybackDisabled()) return
         val app = context.applicationContext
         val prefs = app.getSharedPreferences("innertubex_player_config", Context.MODE_PRIVATE)
         // BotGuard PoTokens minted in a hidden WebView; what WEB_REMIX needs for age-restricted tracks.

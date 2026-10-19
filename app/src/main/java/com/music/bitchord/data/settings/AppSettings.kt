@@ -12,6 +12,8 @@ import com.music.bitchord.auth.AuthStore
 import com.music.bitchord.data.canvas.SpotifyToken
 import com.music.bitchord.data.lyrics.LyricsSource
 import com.music.bitchord.data.sources.SourceKind
+import com.music.bitchord.data.sources.ProviderMatchOverride
+import com.music.bitchord.data.sources.ProviderMatchOverrides
 import com.music.bitchord.playback.EqLayout
 import com.music.bitchord.playback.EqualizerPreset
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,28 +23,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
  * Whether a stream started under this ceiling may be served by [kind].
  *
  * Asked per stream rather than written into
- * [SourceConfig.enabled][com.music.bitchord.data.sources.SourceConfig.enabled],
- * which is what this used to do — an `applyQualityPreset` call flipped the
- * module and JioSaavn switches the moment a rung was picked. Two things
- * were wrong with that and both were reported together: picking a rung for
- * *mobile data* turned the sources off while sitting on Wi-Fi, and nothing
- * turned them back on when the connection changed, so a Wi-Fi ceiling of
- * Lossless still had no lossless source to reach. A ceiling is a property
- * of the connection in force; the switches on the Sources screen are the
- * user's standing choice. Storing the first in the second lost the second.
+ * [SourceConfig.enabled][com.music.bitchord.data.sources.SourceConfig.enabled].
  *
- * [SourceKind.YOUTUBE] is permitted on every rung: it is what [maxKbps]
- * caps, and it is the only source that can answer at all when the ones
- * above it are skipped.
+ * [SourceKind.YOUTUBE] answers false on every rung here: it is catalog-only
+ * and never serves audio, so the ceiling question does not apply to it (see
+ * [SourceRegistry.activeForPlayback], which excludes it outright). Capped
+ * rungs are honored through the request itself — see
+ * [SourceResolver.requestForNow], which asks sources for a capped transcode
+ * instead of excluding them.
  */
 fun AudioQuality.permits(kind: SourceKind): Boolean = when (this) {
-    AudioQuality.LOSSLESS -> true
+    AudioQuality.LOSSLESS -> kind != SourceKind.YOUTUBE
     // No lossless answer is wanted here, and a source that can serve one is
     // the slow half of the list: an addon fronting several catalogues walks
     // all of them before it answers, which is seconds spent to land on a
     // transcode JioSaavn already has at 320.
     AudioQuality.HIGH -> !kind.canServeLossless
-    AudioQuality.MEDIUM, AudioQuality.LOW -> kind == SourceKind.YOUTUBE
+    // Capped rungs permit the same lossy providers; the cap itself travels
+    // in the request (see [SourceResolver.requestForNow]) rather than by
+    // excluding sources here. YouTube Music is catalog-only and excluded.
+    AudioQuality.MEDIUM, AudioQuality.LOW -> !kind.canServeLossless
 }
 
 /**
@@ -621,11 +621,35 @@ object AppSettings {
     val lastfmPrimaryArtistOnly = MutableStateFlow(false)
     val scrobbleMinDuration = MutableStateFlow(30)
     val scrobbleDelayPercent = MutableStateFlow(0.5f)
-    val scrobbleDelaySeconds = MutableStateFlow(180)
+    val scrobbleDelaySeconds = MutableStateFlow(240)
     val listenBrainzEnabled = MutableStateFlow(false)
     val listenBrainzToken = MutableStateFlow("")
     val listenBrainzPrimaryArtistOnly = MutableStateFlow(false)
+    /**
+     * The live `sp_dc` cookie value, mirrored here from encrypted storage
+     * ([AuthStore][com.music.bitchord.auth.AuthStore]) for readers without a
+     * context. In-memory only — never persisted to these plain prefs.
+     */
     val spotifySpdcToken = MutableStateFlow("")
+    /**
+     * Whether a Spotify cookie session is connected. True while a cookie is
+     * stored in [AuthStore][com.music.bitchord.auth.AuthStore].
+     */
+    val spotifyConnected = MutableStateFlow(false)
+    /**
+     * Report local plays of Spotify rows to Spotify history (unofficial).
+     * Feeds "Recently played" and recommendations — never Wrapped, which
+     * counts only streams inside Spotify clients.
+     */
+    val spotifyScrobbleEnabled = MutableStateFlow(true)
+    /** Last successful Spotify library sync epoch-ms, 0 when never synced. */
+    val spotifyLastSyncMs = MutableStateFlow(0L)
+    /** Last Spotify sync failure message, empty when the last sync succeeded. */
+    val spotifyLastSyncError = MutableStateFlow("")
+    /** When true, the first provider error aborts resolution (diagnostics; default off). */
+    val stopOnProviderError = MutableStateFlow(false)
+    /** Per-track playback-source overrides, MetroFuse `audioProviderMatchOverrides` equivalent. */
+    val providerMatchOverrides = MutableStateFlow<Map<String, ProviderMatchOverride>>(emptyMap())
 
     // ── Discord Rich Presence ───────────────────────────────────────────
 
@@ -872,11 +896,17 @@ object AppSettings {
         lastfmPrimaryArtistOnly.value = prefs.getBoolean(KEY_LASTFM_PRIMARY_ARTIST_ONLY, false)
         scrobbleMinDuration.value = prefs.getInt(KEY_SCROBBLE_MIN_DURATION, 30)
         scrobbleDelayPercent.value = prefs.getFloat(KEY_SCROBBLE_DELAY_PERCENT, 0.5f)
-        scrobbleDelaySeconds.value = prefs.getInt(KEY_SCROBBLE_DELAY_SECONDS, 180)
+        scrobbleDelaySeconds.value = prefs.getInt(KEY_SCROBBLE_DELAY_SECONDS, 240)
         listenBrainzEnabled.value = prefs.getBoolean(KEY_LISTENBRAINZ_ENABLED, false)
         listenBrainzToken.value = prefs.getString(KEY_LISTENBRAINZ_TOKEN, "").orEmpty()
         listenBrainzPrimaryArtistOnly.value = prefs.getBoolean(KEY_LISTENBRAINZ_PRIMARY_ARTIST_ONLY, false)
-        spotifySpdcToken.value = prefs.getString(KEY_SPOTIFY_SPDC_TOKEN, "").orEmpty()
+        spotifyConnected.value = prefs.getBoolean(KEY_SPOTIFY_CONNECTED, false)
+        spotifyScrobbleEnabled.value = prefs.getBoolean(KEY_SPOTIFY_SCROBBLE_ENABLED, true)
+        spotifyLastSyncMs.value = prefs.getLong(KEY_SPOTIFY_LAST_SYNC_MS, 0L)
+        spotifyLastSyncError.value = prefs.getString(KEY_SPOTIFY_LAST_SYNC_ERROR, "").orEmpty()
+        stopOnProviderError.value = prefs.getBoolean(KEY_STOP_ON_PROVIDER_ERROR, false)
+        providerMatchOverrides.value =
+            ProviderMatchOverrides.decode(prefs.getString(KEY_PROVIDER_MATCH_OVERRIDES, null))
         replayGenres.value = prefs.getBoolean(KEY_REPLAY_GENRES, true)
         filterNonMusicAudio.value = prefs.getBoolean(KEY_FILTER_NON_MUSIC_AUDIO, true)
         localMusicSort.value = readLocalMusicSort(KEY_LOCAL_MUSIC_SORT)
@@ -1461,8 +1491,49 @@ object AppSettings {
 
     fun setSpotifySpdcToken(value: String) {
         spotifySpdcToken.value = value
-        prefs.edit().putString(KEY_SPOTIFY_SPDC_TOKEN, value).apply()
         SpotifyToken.invalidate()
+    }
+
+    fun setSpotifyConnected(value: Boolean) {
+        spotifyConnected.value = value
+        prefs.edit().putBoolean(KEY_SPOTIFY_CONNECTED, value).apply()
+    }
+
+    fun setSpotifyScrobbleEnabled(value: Boolean) {
+        spotifyScrobbleEnabled.value = value
+        prefs.edit().putBoolean(KEY_SPOTIFY_SCROBBLE_ENABLED, value).apply()
+    }
+
+    fun setSpotifyLastSync(success: Boolean, error: String = "") {
+        if (success) {
+            spotifyLastSyncMs.value = System.currentTimeMillis()
+            spotifyLastSyncError.value = ""
+            prefs.edit().putLong(KEY_SPOTIFY_LAST_SYNC_MS, spotifyLastSyncMs.value)
+                .remove(KEY_SPOTIFY_LAST_SYNC_ERROR).apply()
+        } else {
+            spotifyLastSyncError.value = error
+            prefs.edit().putString(KEY_SPOTIFY_LAST_SYNC_ERROR, error).apply()
+        }
+    }
+
+    fun setStopOnProviderError(value: Boolean) {
+        stopOnProviderError.value = value
+        prefs.edit().putBoolean(KEY_STOP_ON_PROVIDER_ERROR, value).apply()
+    }
+
+    fun setProviderMatchOverride(mediaId: String, override: ProviderMatchOverride?) {
+        val next = if (override == null) {
+            ProviderMatchOverrides.withoutOverride(providerMatchOverrides.value, mediaId)
+        } else {
+            ProviderMatchOverrides.withOverride(providerMatchOverrides.value, mediaId, override)
+        }
+        providerMatchOverrides.value = next
+        prefs.edit().putString(KEY_PROVIDER_MATCH_OVERRIDES, ProviderMatchOverrides.encode(next)).apply()
+    }
+
+    fun clearProviderMatchOverrides() {
+        providerMatchOverrides.value = emptyMap()
+        prefs.edit().remove(KEY_PROVIDER_MATCH_OVERRIDES).apply()
     }
 
     fun setLastfmScrobbleEnabled(value: Boolean) {
@@ -1875,7 +1946,6 @@ object AppSettings {
         KEY_LASTFM_API_KEY,
         KEY_LASTFM_SECRET,
         KEY_LISTENBRAINZ_TOKEN,
-        KEY_SPOTIFY_SPDC_TOKEN,
         KEY_PAXSENIX_API_KEY,
     )
 
@@ -2010,7 +2080,12 @@ object AppSettings {
     private const val KEY_LISTENBRAINZ_ENABLED = "listenbrainz_enabled"
     private const val KEY_LISTENBRAINZ_TOKEN = "listenbrainz_token"
     private const val KEY_LISTENBRAINZ_PRIMARY_ARTIST_ONLY = "listenbrainz_primary_artist_only"
-    private const val KEY_SPOTIFY_SPDC_TOKEN = "spotify_spdc_token"
+    private const val KEY_SPOTIFY_CONNECTED = "spotify_connected"
+    private const val KEY_SPOTIFY_SCROBBLE_ENABLED = "spotify_scrobble_enabled"
+    private const val KEY_SPOTIFY_LAST_SYNC_MS = "spotify_last_sync_ms"
+    private const val KEY_SPOTIFY_LAST_SYNC_ERROR = "spotify_last_sync_error"
+    private const val KEY_STOP_ON_PROVIDER_ERROR = "stop_on_provider_error"
+    private const val KEY_PROVIDER_MATCH_OVERRIDES = "provider_match_overrides"
 
     private const val KEY_DISCORD_USERNAME = "discord_username"
     private const val KEY_DISCORD_NAME = "discord_name"

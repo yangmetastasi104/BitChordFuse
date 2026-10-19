@@ -148,8 +148,10 @@
             </intent-filter>
 
             <!--
-              YouTube Music links: a song, an album, a playlist or an artist,
-              tapped anywhere on the device.
+              YouTube Music catalog links: a song, an album, a playlist or an
+              artist, tapped anywhere on the device. Catalog pages open as
+              metadata; playback of any row resolves through the provider
+              sources.
 
               Not autoVerify. Verification is a claim to *own* these domains,
               which BitChord doesn't — and on Android 12+ an app that has

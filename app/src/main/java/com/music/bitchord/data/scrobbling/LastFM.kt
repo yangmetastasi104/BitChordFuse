@@ -14,6 +14,10 @@ import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import java.net.URI
 import java.security.MessageDigest
 import java.util.Locale
@@ -71,12 +75,7 @@ object LastFM {
         }
     }
 
-    private fun Map<String, String>.apiSig(secret: String): String {
-        val sorted = toSortedMap()
-        val toHash = sorted.entries.joinToString("") { it.key + it.value } + secret
-        val digest = MessageDigest.getInstance("MD5").digest(toHash.toByteArray())
-        return digest.joinToString("") { "%02x".format(Locale.ROOT, it) }
-    }
+    private fun Map<String, String>.apiSig(secret: String): String = apiSignature(this, secret)
 
     private fun HttpRequestBuilder.lastfmParams(
         method: String,
@@ -282,17 +281,129 @@ object LastFM {
             }
 
         val responseText = response.bodyAsText()
+        // The body is read before the status is judged. Last.fm answers a
+        // malformed request with a non-2xx *and* an error document, and it is
+        // the document's code — not the HTTP status — that decides whether
+        // trying again could ever help. See [LastFmScrobbler].
+        responseText.asLastFmFailure()?.let { throw it }
         if (!response.status.isSuccess()) {
             throw LastFmException(response.status.value, response.status.description)
-        }
-        if (responseText.contains("\"error\"")) {
-            val error = json.decodeFromString<LastFmError>(responseText)
-            throw LastFmException(error.error, error.message)
         }
         return responseText
     }
 
+    /**
+     * The failure a response body reports, or null when it reports a success.
+     *
+     * Read out of a parsed document rather than searched for as text. A track
+     * whose title holds the word `error` is not a failed request, and matching
+     * on the substring treated it as one: the scrobble was thrown away even
+     * though the request had been accepted. Last.fm signals a real failure with
+     * a top-level `error` member and nothing else.
+     */
+    private fun String.asLastFmFailure(): LastFmException? {
+        val root =
+            runCatching { json.parseToJsonElement(this) }.getOrNull() as? JsonObject
+                ?: return null
+        val code = (root["error"] as? JsonPrimitive)?.intOrNull ?: return null
+        val message = (root["message"] as? JsonPrimitive)?.contentOrNull
+        return LastFmException(code, message ?: "Last.fm error $code")
+    }
+
     const val DEFAULT_SCROBBLE_DELAY_PERCENT = 0.5f
     const val DEFAULT_SCROBBLE_MIN_SONG_DURATION = 30
-    const val DEFAULT_SCROBBLE_DELAY_SECONDS = 180
+
+    /**
+     * The cap on the half-the-track rule: four minutes, as the Scrobbling 2.0
+     * documentation states it — "played for at least half its duration, or for
+     * 4 minutes (whichever occurs earlier)".
+     */
+    const val DEFAULT_SCROBBLE_DELAY_SECONDS = 240
+}
+
+/**
+ * The Last.fm `api_sig`.
+ *
+ * Every parameter sent, `format` and `callback` excepted, sorted by name,
+ * concatenated as `name`+`value`, with the shared secret appended, then hashed
+ * with MD5 and rendered as lowercase hex.
+ *
+ * Extracted from the request builder so it can be pinned against a known
+ * vector. A signature that is wrong in any small way is rejected as "Invalid
+ * method signature" on every single call, and the only symptom in the app is
+ * that nothing is ever scrobbled — which is exactly the kind of failure nobody
+ * reports.
+ *
+ * The byte encoding is stated rather than defaulted: the API requires UTF-8,
+ * and a platform default that differs (as it does on a Windows JVM) would sign
+ * non-ASCII metadata with different bytes than the ones that are sent.
+ */
+internal fun apiSignature(
+    params: Map<String, String>,
+    secret: String,
+): String {
+    val toHash = params.toSortedMap().entries.joinToString("") { it.key + it.value } + secret
+    val digest = MessageDigest.getInstance("MD5").digest(toHash.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(Locale.ROOT, it) }
+}
+
+/**
+ * [ScrobbleRequest]s sent to Last.fm, with Last.fm's answer translated into
+ * whether the attempt is worth repeating.
+ *
+ * The retry list is the API's own: error **11** ("Service Offline") and error
+ * **16** ("The service is temporarily unavailable") are the two it asks a
+ * client to retry, error **9** asks for a re-authentication first, and
+ * everything else means the request was wrong and would be wrong again. A
+ * request that never reached the service at all is retried too.
+ */
+internal object LastFmScrobbler : Scrobbler {
+    /** Last.fm error 11 — "Service Offline - This service is temporarily offline, try again later." */
+    private const val ERROR_SERVICE_OFFLINE = 11
+
+    /** Last.fm error 16 — "The service is temporarily unavailable, please try again." */
+    private const val ERROR_TEMPORARILY_UNAVAILABLE = 16
+
+    /**
+     * Above this the number can only be an HTTP status: Last.fm's own error
+     * codes do not reach it. A 5xx is the server having a bad time, which is
+     * worth another attempt.
+     */
+    private const val FIRST_HTTP_SERVER_ERROR = 500
+
+    override suspend fun submit(request: ScrobbleRequest): Submission =
+        when (request) {
+            is ScrobbleRequest.NowPlaying ->
+                LastFM
+                    .updateNowPlaying(
+                        artist = request.artist,
+                        track = request.track,
+                        album = request.album,
+                        duration = request.durationSeconds.takeIf { it > 0 },
+                    ).asSubmission()
+
+            is ScrobbleRequest.Scrobble ->
+                LastFM
+                    .scrobble(
+                        artist = request.artist,
+                        track = request.track,
+                        timestamp = request.timestampSeconds,
+                        album = request.album,
+                        duration = request.durationSeconds.takeIf { it > 0 },
+                    ).asSubmission()
+        }
+
+    private fun Result<*>.asSubmission(): Submission =
+        fold(
+            onSuccess = { Submission.ACCEPTED },
+            onFailure = { throwable ->
+                when {
+                    throwable !is LastFM.LastFmException -> Submission.RETRY
+                    throwable.code == ERROR_SERVICE_OFFLINE -> Submission.RETRY
+                    throwable.code == ERROR_TEMPORARILY_UNAVAILABLE -> Submission.RETRY
+                    throwable.code >= FIRST_HTTP_SERVER_ERROR -> Submission.RETRY
+                    else -> Submission.FAILED
+                }
+            },
+        )
 }

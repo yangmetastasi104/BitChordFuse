@@ -80,6 +80,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
@@ -167,7 +168,6 @@ import com.music.bitchord.ui.screens.SettingsScreen
 import com.music.bitchord.ui.screens.SourceEditorAlert
 import com.music.bitchord.ui.screens.SourcesScreen
 import com.music.bitchord.data.sources.TrackMatcher
-import com.music.bitchord.ui.screens.SpotifyCanvasAuthScreen
 import com.music.bitchord.ui.screens.SpotifyLibraryScreen
 import com.music.bitchord.data.spotify.SPOTIFY_PAGE_PREFIX
 import com.music.bitchord.playback.AudioCache
@@ -553,7 +553,6 @@ private fun BitChordApp(
     var showSources by rememberSaveable { mutableStateOf(false) }
     var showListenTogether by rememberSaveable { mutableStateOf(false) }
     var showEqualizer by rememberSaveable { mutableStateOf(false) }
-    var showSpotifyCanvasAuth by remember { mutableStateOf(false) }
 
     // Hosted here rather than inside SourcesScreen so its frosted card has
     // something to blur: that screen is drawn inside the `hazeSource` subtree,
@@ -2787,7 +2786,6 @@ private fun BitChordApp(
                                 settingsSubScreen = "listen_together"
                                 showListenTogether = true
                             },
-                            onSpotifyCanvasAuth = { showSpotifyCanvasAuth = true },
                             onAppLanguage = { showAppLanguage = true },
                             contentPadding = listPadding,
                         )
@@ -3000,6 +2998,10 @@ private fun BitChordApp(
                                         song,
                                         QueueSource(shelfTitle, PlaybackSourceType.HOME),
                                     )
+                                    // Home's own door to Spotify: the invite /
+                                    // library card opens the Spotify page, the
+                                    // same place the Library tab's row does.
+                                    browseId == SPOTIFY_BROWSE_ID -> showSpotify = true
                                     browseId != null -> viewModel.openDetail(
                                         browseId = browseId,
                                         title = item.title,
@@ -5096,12 +5098,8 @@ private fun BitChordApp(
             }
         }
 
-        if (showSpotifyCanvasAuth) {
-            BackHandler { showSpotifyCanvasAuth = false }
-            SpotifyCanvasAuthScreen(
-                onNavigateUp = { showSpotifyCanvasAuth = false }
-            )
-        }
+        // Spotify Canvas sign-in removed: it collected an sp_dc session
+        // cookie, which this build no longer uses anywhere.
 
         discordDialog?.let { which ->
             DiscordDialogHost(

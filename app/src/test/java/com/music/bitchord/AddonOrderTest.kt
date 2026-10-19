@@ -37,8 +37,7 @@ class AddonOrderTest {
     private fun seed(vararg names: String): List<SourceConfig> {
         val addons = names.map(::addon)
         SourceRegistry.configs.value = addons +
-            SourceConfig(kind = SourceKind.JIOSAAVN) +
-            SourceConfig(kind = SourceKind.YOUTUBE)
+            SourceConfig(kind = SourceKind.JIOSAAVN)
         return addons
     }
 
@@ -63,7 +62,7 @@ class AddonOrderTest {
         SourceRegistry.reorderAddons(listOf(addons[1].id, addons[0].id))
 
         assertEquals(
-            listOf(SourceKind.ADDON, SourceKind.ADDON, SourceKind.JIOSAAVN, SourceKind.YOUTUBE),
+            listOf(SourceKind.ADDON, SourceKind.ADDON, SourceKind.JIOSAAVN),
             SourceRegistry.configs.value.map { it.kind },
         )
     }

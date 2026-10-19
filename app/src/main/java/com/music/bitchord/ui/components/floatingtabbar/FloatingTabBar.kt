@@ -1110,6 +1110,12 @@ private fun Modifier.animateEnterExitTab(
         // on a wider and wider sample of empty space. 12 reaches the same nothing
         // over a quarter of the area, and there are six of these running at once
         // in the middle of the fold, over glass that is sampling the screen.
+        //
+        // Skipped outright under reduce-motion and on low-RAM devices: a blur
+        // animation re-renders an offscreen layer every frame, and the alpha
+        // fade alone carries the transition. The still frame is identical —
+        // the blur is 0 at rest either way.
+        val reduceMotionBlur = reduceEnterExitBlur()
         val blurRadius = with(LocalDensity.current) { 12.dp.toPx() }
         val animatedBlur by transition.animateFloat(
             transitionSpec = {
@@ -1136,9 +1142,31 @@ private fun Modifier.animateEnterExitTab(
             // every tab glyph and every tab label a permanent offscreen buffer to
             // pay for a blur of nothing — on a bar that is on screen the whole
             // time the app is.
+            //
+            // Also null throughout when the blur animation is skipped
+            // (reduce-motion / low-RAM): no offscreen pass at all mid-fold.
             renderEffect =
-                if (animatedBlur > 0f) BlurEffect(animatedBlur, animatedBlur) else null
+                if (!reduceMotionBlur && animatedBlur > 0f) BlurEffect(animatedBlur, animatedBlur) else null
         }
+    }
+}
+
+/**
+ * Whether the tab enter/exit blur animation should be skipped (alpha fade
+ * only): under the reduce-motion setting, or on low-RAM devices where six
+ * simultaneous offscreen blur layers mid-fold drop frames.
+ */
+@Composable
+private fun reduceEnterExitBlur(): Boolean {
+    val reduceAnimation by AppSettings.reduceAnimation.collectAsStateWithLifecycle()
+    if (reduceAnimation) return true
+    val context = androidx.compose.ui.platform.LocalContext.current
+    return remember {
+        runCatching {
+            val manager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager
+            manager?.isLowRamDevice == true
+        }.getOrDefault(false)
     }
 }
 

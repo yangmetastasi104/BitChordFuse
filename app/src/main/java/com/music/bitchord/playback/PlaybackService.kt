@@ -1284,29 +1284,28 @@ class PlaybackService : MediaLibraryService() {
             if (dataSpec.uri.authority == "source") {
                 val directYouTube =
                     dataSpec.uri.getQueryParameter(DIRECT_YOUTUBE_PARAMETER) == "1"
+                if (directYouTube) {
+                    // The one-way YouTube escape hatch is gone with YouTube
+                    // Music: a failed provider stream has nowhere to fall back
+                    // to. Surface it as the miss it is.
+                    throw java.io.IOException(
+                        "No YouTube audio fallback for ${dataSpec.uri.getQueryParameter("n")}: " +
+                            "YouTube Music is disabled and no enabled source served this track",
+                    )
+                }
                 val stream = runBlocking(about) {
                     withTimeout(RESOLVE_TIMEOUT_MS) {
-                        if (directYouTube) {
-                            SourceResolver.youtubeFallback(SourceResolver.targetIn(dataSpec.uri))
-                        } else {
-                            SourceResolver.resolve(dataSpec.uri)
-                        }
+                        SourceResolver.resolve(dataSpec.uri)
                     }
                 } ?: throw java.io.IOException(
-                    if (directYouTube) {
-                        "No YouTube audio fallback matched ${dataSpec.uri.getQueryParameter("n")}"
-                    } else {
-                        "No enabled source could serve ${dataSpec.uri.getQueryParameter("n")}"
-                    },
+                    "No enabled source could serve ${dataSpec.uri.getQueryParameter("n")}: " +
+                        "configure an add-on source in Settings → Sources",
                 )
                 val configId = dataSpec.uri.getQueryParameter("s")
-                val sourceName = if (directYouTube) {
-                    "YouTube"
-                } else {
+                val sourceName =
                     stream.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
                         ?: configId?.let { SourceRegistry.config(it)?.displayName }
                         ?: "Source"
-                }
                 val trackParam = dataSpec.uri.getQueryParameter("t")
                 val fullMediaId = mediaIdIn(dataSpec.uri)
                 NerdStats.onSourceStream(fullMediaId ?: trackParam, stream.format, sourceName)
@@ -1316,58 +1315,28 @@ class PlaybackService : MediaLibraryService() {
                 NerdStats.recordSource(trackParam, sourceName)
                 return@Resolver dataSpec.buildUpon()
                     .setUri(Uri.parse(stream.url))
-                    .setHttpRequestHeaders(
-                        if (directYouTube) StreamResolver.mediaHeadersFor(stream.url)
-                        else stream.headers,
-                    )
+                    .setHttpRequestHeaders(stream.headers)
                     .build()
             }
             val videoId = dataSpec.uri.getQueryParameter("v")
                 ?: return@Resolver dataSpec
-            // An explicit rollback is not a preference for a different
-            // candidate: it means this exact YouTube rendition, immediately.
-            // Answer it before StreamChoice, the module race and a pending
-            // upgrade can put another source back under the listener.
+            // An explicit rollback asked for YouTube's own rendition. YouTube
+            // Music is disabled, so there is no original to roll back to:
+            // report the miss rather than resolving elsewhere silently.
             if (dataSpec.uri.getQueryParameter(DIRECT_YOUTUBE_PARAMETER) == "1") {
                 QualityUpgrade.forget(videoId)
                 StreamChoice.forget(videoId)
                 NerdStats.clearDeclared(videoId)
-                NerdStats.recordSource(videoId, "YouTube")
-                val streamUrl = try {
-                    runBlocking(about) {
-                        withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
-                    }
-                } catch (e: TimeoutCancellationException) {
-                    throw java.io.IOException("Direct YouTube resolution timed out for $videoId", e)
-                }
-                val headers = StreamResolver.mediaHeadersFor(streamUrl)
-                TrackLog.d("BitChord", "serving original YouTube version for $videoId", about = videoId)
-                return@Resolver dataSpec.buildUpon()
-                    .setUri(Uri.parse(streamUrl))
-                    .setHttpRequestHeaders(headers)
-                    .build()
-            }
-            // Automix owns a base-cache Opus rendition. It must bypass the
-            // playback race winner (JioSaavn, a module, or a lossless upgrade)
-            // and resolve directly to YouTube for this analysis-only request.
-            if (AutomixAnalysisSource.requestsYouTubeOpus(
-                    dataSpec.uri.getQueryParameter(AutomixAnalysisSource.OPUS_QUERY_PARAMETER),
+                throw java.io.IOException(
+                    "Original YouTube version unavailable for $videoId: " +
+                        "YouTube Music is disabled in this build",
                 )
-            ) {
-                NerdStats.recordSource(videoId, "YouTube")
-                val streamUrl = try {
-                    runBlocking(about) {
-                        withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
-                    }
-                } catch (e: TimeoutCancellationException) {
-                    throw java.io.IOException("Automix Opus resolution timed out for $videoId", e)
-                }
-                val headers = StreamResolver.mediaHeadersFor(streamUrl)
-                return@Resolver dataSpec.buildUpon()
-                    .setUri(Uri.parse(streamUrl))
-                    .setHttpRequestHeaders(headers)
-                    .build()
             }
+            // Automix analysis input was the YouTube Opus copy. With YouTube
+            // Music disabled ([AutomixAnalysisSource.youtubeOpusEnabled] is
+            // false) no analysis URI is ever produced, so there is nothing to
+            // resolve here; analysis requests fall through to the provider
+            // match below and miss cleanly.
             // An upgraded item carries a marker and its stream has already
             // been found — see [QualityUpgrade]. Answered before anything
             // else, and without re-resolving: this exact URL is what the
@@ -1468,72 +1437,58 @@ class PlaybackService : MediaLibraryService() {
                     .setHttpRequestHeaders(serving.headers)
                     .build()
             }
-            // A track queued from YouTube may be held by a source the user
-            // ranked above it — see [SourceResolver.substituteForYouTube] and
-            // [raceYouTubeOrModule]. Only worth the extra lookup when
-            // something actually outranks YouTube; otherwise this is the
-            // plain resolve every build before this one made.
-            if (!SourceResolver.canSubstituteForYouTube()) {
-                val streamUrl = try {
-                    runBlocking(about) {
-                        withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
+            // A queued track is matched against the enabled provider sources.
+            // With nothing enabled or nothing matching, the miss surfaces as
+            // a clear error: there is no fallback in this build.
+            if (!SourceResolver.canSubstitute()) {
+                // Provider-only resolve: match the queued metadata against the
+                // enabled sources. A miss surfaces below as "no enabled
+                // source" rather than a silent fallback.
+                val won = runBlocking(about) {
+                    withTimeout(RESOLVE_TIMEOUT_MS) {
+                        resolveViaProviders(
+                            videoId = videoId,
+                            target = SourceResolver.targetIn(dataSpec.uri),
+                        )
                     }
-                } catch (e: TimeoutCancellationException) {
-                    throw java.io.IOException("Stream resolution timed out for $videoId", e)
+                } ?: throw java.io.IOException(
+                    "No enabled add-on source could serve $videoId",
+                )
+                val sourceName = won.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
+                    ?: "Provider"
+                NerdStats.onSourceStream(videoId, won.format, sourceName)
+                won.format.kbps?.let { kbps ->
+                    NerdStats.onStreamPicked(videoId, kbps, sourceName)
                 }
-                // googlevideo names the client that minted the URL inside the
-                // URL itself, and compares it against the request that comes
-                // back for the bytes. A mismatch is answered with a throttled
-                // trickle or a 403 rather than an error worth the name, so the
-                // fetch is dressed as whatever the URL says it should be.
-                val headers = StreamResolver.mediaHeadersFor(streamUrl)
-                // Recorded even though only one server can answer here: a
-                // source enabled from Settings mid-track flips the branch
-                // above under a half-filled cache entry, and the entry would
-                // then be finished by a different file.
-                NerdStats.recordSource(videoId, "YouTube")
-                StreamChoice.remember(videoId, SourceStream(streamUrl, headers = headers), substituted = false)
+                NerdStats.recordSource(videoId, sourceName)
+                StreamChoice.remember(videoId, won, substituted = true)
                 return@Resolver dataSpec.buildUpon()
-                    .setUri(Uri.parse(streamUrl))
-                    .setHttpRequestHeaders(headers)
+                    .setUri(Uri.parse(won.url))
+                    .setHttpRequestHeaders(won.headers)
                     .build()
             }
             val won = runBlocking(about) {
-                resolveWithModulePriority(
-                    videoId = videoId,
-                    target = SourceResolver.targetIn(dataSpec.uri),
-                )
-            }
-            when (won) {
-                is Resolved.Module -> {
-                    val sourceName = won.stream.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
-                        ?: "Module"
-                    NerdStats.onSourceStream(videoId, won.stream.format, sourceName)
-                    NerdStats.recordSource(videoId, sourceName)
-                    StreamChoice.remember(videoId, won.stream, substituted = true)
-                    dataSpec.buildUpon()
-                        .setUri(Uri.parse(won.stream.url))
-                        .setHttpRequestHeaders(won.stream.headers)
-                        .build()
+                withTimeout(RESOLVE_TIMEOUT_MS) {
+                    resolveViaProviders(
+                        videoId = videoId,
+                        target = SourceResolver.targetIn(dataSpec.uri),
+                    )
                 }
-                // A module could have served this and didn't — it missed, its
-                // server was slow, or the lookup ran out of budget. The last
-                // of those is worth chasing rather than accepting: measured
-                // here, a module's stream URL arrived 66ms after the live path
-                // gave up on it, and the difference between a FLAC and a
-                // YouTube Opus stream came down to that. The second look has
-                // no such deadline, so what was nearly in hand is asked for
-                // again while the fallback plays.
-                is Resolved.YouTube -> {
-                    NerdStats.recordSource(videoId, "YouTube")
-                    val headers = StreamResolver.mediaHeadersFor(won.url)
-                    StreamChoice.remember(videoId, SourceStream(won.url, headers = headers), substituted = false)
-                    dataSpec.buildUpon()
-                        .setUri(Uri.parse(won.url))
-                        .setHttpRequestHeaders(headers)
-                        .build()
-                }
+            } ?: throw java.io.IOException(
+                "No enabled add-on source could serve $videoId",
+            )
+            val sourceName = won.sourceConfigId?.let { SourceRegistry.config(it)?.displayName }
+                ?: "Provider"
+            NerdStats.onSourceStream(videoId, won.format, sourceName)
+            won.format.kbps?.let { kbps ->
+                NerdStats.onStreamPicked(videoId, kbps, sourceName)
             }
+            NerdStats.recordSource(videoId, sourceName)
+            StreamChoice.remember(videoId, won, substituted = true)
+            dataSpec.buildUpon()
+                .setUri(Uri.parse(won.url))
+                .setHttpRequestHeaders(won.headers)
+                .build()
         }
 
         this.streamResolver = streamResolver
@@ -2965,6 +2920,7 @@ class PlaybackService : MediaLibraryService() {
 
         // Scrobbling: stop old song, start new song
         scrobbleManager?.onSongStop()
+        com.music.bitchord.data.spotify.SpotifyScrobbler.onSongStop()
         // And the local record, which needs the transition even when the track
         // id doesn't change: repeat-one plays the same song again, and without
         // this the second play through is a continuation of the first and is
@@ -2974,6 +2930,7 @@ class PlaybackService : MediaLibraryService() {
         val durationMs = exoPlayer.duration.takeIf { it > 0 }
         if (exoPlayer.isPlaying) {
             scrobbleManager?.onSongStart(newSong, durationMs)
+            com.music.bitchord.data.spotify.SpotifyScrobbler.onSongStart(newSong, durationMs)
         }
 
         // ListenBrainz: submit finished for old song, playing_now for new song.
@@ -3204,9 +3161,10 @@ class PlaybackService : MediaLibraryService() {
         }
         // An addon/JioSaavn stream gets one chance. If it fails after selection,
         // retrying the ordinary item only lets the same deterministic lookup win
-        // again. Rebuild it as an explicit YouTube request instead. This also
-        // clears a DASH/HLS MIME left on an upgraded item, which otherwise makes
-        // Media3 parse YouTube's WebM bytes as a manifest forever.
+        // again. The failure is recorded and never re-offered during this
+        // playback instead — see [fallbackFailedAlternativeToYouTube]. There is
+        // no fallback source to rebuild the item as: YouTube Music is disabled.
+        // This also used to clear a DASH/HLS MIME left on an upgraded item.
         if (fallbackFailedAlternativeToYouTube(item, uri, position)) return
         // A manifest read as audio is not a broken stream, and everything below
         // this line would treat it as one. Ahead of the verdict and the attempt
@@ -3354,8 +3312,13 @@ class PlaybackService : MediaLibraryService() {
     }
 
     /**
-     * Replaces a failed addon/JioSaavn/quality-upgrade rendition with YouTube
-     * audio and never offers the failed source again during this playback.
+     * Records a failed addon/JioSaavn/quality-upgrade rendition so it is
+     * never offered again during this playback, then declines to recover.
+     *
+     * This used to rebuild the item as an explicit YouTube request. With
+     * YouTube Music disabled there is no fallback rendition to rebuild it
+     * as, so the failure stands and [recoverFrom] carries on to the generic
+     * retry budget below, which surfaces the error once attempts run out.
      */
     private fun fallbackFailedAlternativeToYouTube(
         item: MediaItem,
@@ -3366,7 +3329,6 @@ class PlaybackService : MediaLibraryService() {
         val videoId = playbackUri.getQueryParameter("v")
         val substituted = videoId?.let(StreamChoice::isSubstitute) == true
         if (!PlaybackFallback.isAlternative(playbackUri.toString(), substituted)) return false
-        val fallback = item.toYouTubeFallbackMediaItem() ?: return false
         val mediaId = item.mediaId
 
         QualityUpgrade.forget(mediaId)
@@ -3379,23 +3341,10 @@ class PlaybackService : MediaLibraryService() {
         recoveries.remove(mediaId)
         TrackLog.w(
             "BitChord",
-            "$mediaId failed on a higher-quality source; falling back to YouTube audio",
+            "$mediaId failed on a provider source with no fallback available",
             about = mediaId,
         )
-
-        scope.launch(TrackLog.about(mediaId)) {
-            delay(RECOVERY_DELAY_MS)
-            withContext(Dispatchers.IO) { AudioCache.discard(playbackUri) }
-            withContext(Dispatchers.Main) {
-                val live = this@PlaybackService.player ?: return@withContext
-                if (live.currentMediaItem?.mediaId != mediaId) return@withContext
-                swappingMediaId = mediaId
-                live.replaceMediaItem(live.currentMediaItemIndex, fallback)
-                live.seekTo(live.currentMediaItemIndex, position)
-                live.prepare()
-            }
-        }
-        return true
+        return false
     }
 
     /**
@@ -4592,167 +4541,65 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
-    /** What [resolveWithModulePriority] settled on. */
-    private sealed interface Resolved {
-        data class Module(val stream: SourceStream) : Resolved
-        data class YouTube(val url: String) : Resolved
-    }
-
     /**
-     * Resolves a YouTube-queued track by racing the higher-ranked modules
-     * against YouTube itself, and handing whatever the modules are still doing
-     * to [QualityUpgrade] if YouTube gets there first.
+     * Resolves a queued track against the enabled provider sources.
      *
-     * Nobody gets a head start. An earlier version gave the modules six
-     * seconds of silence to answer in before the fallback was even *asked*
-     * for, on the reasoning that a module answering inside that window plays
-     * with no seam in it. What that actually bought, on every track the
-     * modules were slow on, was six seconds of nothing followed by a YouTube
-     * client walk starting from cold — the wait and the seam, rather than one
-     * or the other. Starting both at once removes the first of those: the
-     * track begins as soon as *anything* can serve it.
+     * There is no fallback leg: YouTube Music is disabled, so the provider
+     * lookup is the whole race rather than half of one. A hit plays from the
+     * first note; a below-request hit is handed to [QualityUpgrade] for the
+     * second look while it plays; a miss returns null and the caller reports
+     * "no enabled source".
      *
-     * The speculative resolve this reinstates was dropped once before, for a
-     * real reason — it is several round trips to `youtubei.googleapis.com`
-     * competing for the same radio and connection pool as the lookup beside
-     * it, and on a track the modules do have, that work is thrown away. What
-     * changed is that it is no longer speculative: YouTube is now the expected
-     * outcome for anything the modules don't answer quickly, so its walk is on
-     * the critical path rather than hedging one. It is also coalesced and
-     * cached — see [StreamResolver.resolve] — so even a discarded walk warms
-     * the URL this track will want if the upgrade later falls through.
-     *
-     * A module that wins the race outright still wins the track, which is the
-     * one thing worth keeping from the old head start: the lossless copy plays
-     * from the first note and there is no swap at all. That is a narrower
-     * window than it sounds, and deliberately so — read-ahead warms the
-     * YouTube URL for the queue (see [AudioCache.prefetchQueue]), so on a
-     * track that was read ahead the fallback answers in milliseconds and
-     * almost always wins. The swap is the ordinary path now; playing from the
-     * first note is the prize for a module quick enough to beat a cached URL.
-     *
-     * A lookup that loses is not cancelled. It is handed over still running,
-     * because it is not wrong, only late, and the thing it is about to return
-     * is exactly the stream that would have played seamlessly had it been
-     * quicker. It finishes on its own time and the track swaps up to it
-     * mid-song, which is the trade this whole path exists to make: a short
-     * break in the audio, in exchange for the listener hearing something now
-     * rather than waiting in silence for the good copy.
+     * A substitute that already broke this track once is still retried here
+     * rather than skipped: with no fallback, skipping would fail a track a
+     * provider might serve on a second attempt (its server may have recovered),
+     * and [StreamChoice.refuseSubstitutes] still protects the player from
+     * looping on an unplayable URL.
      */
-    private suspend fun resolveWithModulePriority(
+    private suspend fun resolveViaProviders(
         videoId: String,
         target: TrackMatcher.Target,
-    ): Resolved {
-        // A substitute already broke this track once — see
-        // [StreamChoice.refuseSubstitutes]. Racing the modules again would find
-        // the same catalogue holding the same unplayable URL, so there is
-        // nothing to race: YouTube is the one answer here that hasn't failed.
-        // Skipped entirely rather than merely deprioritised, because a lookup
-        // that loses is handed to [QualityUpgrade] rather than dropped, and
-        // handing over the search that just cost three attempts would only
-        // schedule a fourth.
-        if (StreamChoice.substitutesRefused(videoId)) {
-            return Resolved.YouTube(StreamResolver.resolve(videoId))
-        }
+    ): SourceStream? {
         NerdStats.onLosslessRaceStart(videoId)
-        // Both legs are parented to the service's scope rather than to the
-        // caller, so neither inherits whose track this is — see
-        // [TrackLog.about]. Without it the module walk and the client walk both
-        // log from a scope that knows nothing, which is most of what a resolve
-        // has to say about itself.
+        // Parented to the service's scope rather than to the caller, so it
+        // does not inherit whose track this is - see [TrackLog.about].
         val lookup = scope.async(Dispatchers.IO + TrackLog.about(videoId)) {
             withTimeoutOrNull(SUBSTITUTE_TIMEOUT_MS) { SourceResolver.substituteForYouTube(target) }
-        }
-        // Started now rather than after the modules have had their say, and
-        // wrapped rather than thrown from: it is awaited only on the paths
-        // that need it, and an async that fails without ever being awaited is
-        // an unhandled exception in this service's scope.
-        val fallback = scope.async(Dispatchers.IO + TrackLog.about(videoId)) {
-            runCatching { StreamResolver.resolve(videoId) }
-        }
-
-        // First past the post. A null because [lookup] won is a module miss; a
-        // null because [fallback] won means YouTube has a URL and the modules
-        // are still looking — [lookup.isActive] below is what tells those
-        // apart, which is the question the old head start answered by timing
-        // out rather than by asking.
-        val quick: SourceStream? = select {
-            lookup.onAwait { it }
-            // A fallback that finished without a URL has not won anything.
-            //
-            // This clause used to yield null unconditionally, which treats "the
-            // YouTube walk is over" as "YouTube has a URL" — true only while
-            // failing was the slow outcome. It no longer is: [StreamResolver]
-            // now answers a known-unplayable track immediately, so the losing
-            // leg crosses the line first and, before this, took the track down
-            // with it while a module lookup that was about to succeed was still
-            // running. Exactly the case in the report — an age-gated track that
-            // YouTube would never serve and a catalogue that had it all along.
-            fallback.onAwait { resolved -> if (resolved.isSuccess) null else lookup.await() }
         }
 
         // A manifest cannot be substituted here, however good it is. This
         // function runs on the loader thread, *inside* the open of a media
         // source that was built minutes ago from an extensionless
-        // `bitchord://` URI — so the source is already progressive and cannot
+        // `bitchord://` URI - so the source is already progressive and cannot
         // be told otherwise, and handing it a manifest is a track that fails
         // at 0ms rather than a track that plays lossless. See [StreamContainer]
         // for the log of exactly that.
         //
-        // Nothing is thrown away for it. What the modules found is passed to
-        // the second look already answered, which is the same handover a lookup
-        // that merely lost the race gets — and [QualityUpgrade]'s swap does
+        // Nothing is thrown away for it. What the providers found is passed to
+        // the second look already answered, and [QualityUpgrade]'s swap does
         // declare the type, so the manifest plays there. The cost is a seam a
         // few seconds in instead of a clean start, which is the trade this
         // whole path is built to make.
+        val quick: SourceStream? = lookup.await()
         if (quick != null && StreamContainer.isManifest(quick.url)) {
-            val url = runCatching { fallback.await().getOrThrow() }.getOrNull()
-            if (url != null) {
-                TrackLog.d(
-                    "BitChord",
-                    "'${target.title}' was offered ${quick.format.summary} as a manifest; " +
-                        "starting on YouTube and swapping to it under the music",
-                    about = videoId,
-                )
-                val handed = QualityUpgrade.settledForLess(
-                    mediaId = videoId,
-                    target = target,
-                    inFlight = CompletableDeferred(quick),
-                    playing = NerdStats.pickedBitrateKbps(videoId)?.let { StreamFormat(kbps = it) },
-                )
-                if (!handed) NerdStats.onLosslessRaceEnd(videoId)
-                return Resolved.YouTube(url)
-            }
-            // YouTube cannot serve it either, so there is nothing to start on
-            // and nothing to swap from. The manifest goes out as it is: it will
-            // fail its first read, and [replayAsManifest] rebuilds the item
-            // with the type declared and prepares it again. A cut before the
-            // first note beats a track that does not play at all.
             TrackLog.w(
                 "BitChord",
-                "'${target.title}' has only a manifest and YouTube cannot serve it; " +
-                    "letting it fail once to declare its type",
+                "'${target.title}' has only a manifest; letting it fail once to declare its type",
                 about = videoId,
             )
             NerdStats.onLosslessRaceEnd(videoId)
-            return Resolved.Module(quick)
+            return quick
         }
 
         if (quick != null) {
-            // The modules got there first, so the YouTube walk is genuinely
-            // spare work now. Cancelling drops only this service's wait on it;
-            // [StreamResolver] parents the walk itself elsewhere and lets it
-            // finish into its own cache.
-            fallback.cancel()
-            // Everything that was asked for, ahead of the fallback: the
-            // ordinary good case, and the one with no seam in it.
+            // Everything that was asked for: the ordinary good case, and the
+            // one with no seam in it.
             if (!quick.belowRequest) {
                 NerdStats.onLosslessRaceEnd(videoId)
-                return Resolved.Module(quick)
+                return quick
             }
-            // Less than was asked for — but a lossy copy from a module still
-            // beats going back to YouTube for one. Worth a second look, and
-            // with this lookup already finished that look starts from scratch.
+            // Less than was asked for - still worth playing, and worth a
+            // second look while it plays.
             val settled = QualityUpgrade.settledForLess(
                 mediaId = videoId,
                 target = target,
@@ -4760,24 +4607,11 @@ class PlaybackService : MediaLibraryService() {
                 servedBy = quick.sourceConfigId,
             )
             if (!settled) NerdStats.onLosslessRaceEnd(videoId)
-            return Resolved.Module(quick)
+            return quick
         }
 
-        val url = fallback.await().getOrThrow()
-        // Marked pending only here, with the fallback's own bitrate in hand:
-        // that figure is the answer to "better than what?" the second look
-        // measures candidates against, and it isn't known until the client
-        // walk has picked a format. A lookup still running is handed over to
-        // be waited on rather than repeated; one that already finished with
-        // nothing leaves the second look to find its own candidates.
-        val pending = QualityUpgrade.settledForLess(
-            mediaId = videoId,
-            target = target,
-            inFlight = lookup.takeIf { lookup.isActive },
-            playing = NerdStats.pickedBitrateKbps(videoId)?.let { StreamFormat(kbps = it) },
-        )
-        if (!pending) NerdStats.onLosslessRaceEnd(videoId)
-        return Resolved.YouTube(url)
+        NerdStats.onLosslessRaceEnd(videoId)
+        return null
     }
 
     /**
@@ -5295,14 +5129,15 @@ class PlaybackService : MediaLibraryService() {
      */
     private fun prefetchAround(player: ExoPlayer) {
         val nextIndex = player.nextMediaItemIndex
-        val upcomingSongs = if (nextIndex != C.INDEX_UNSET) {
+        val upcomingItems = if (nextIndex != C.INDEX_UNSET) {
             val end = (nextIndex + AudioCache.QUEUE_DEPTH - 1).coerceAtMost(player.mediaItemCount - 1)
-            (nextIndex..end).map { index -> player.getMediaItemAt(index).toSong() }
+            (nextIndex..end).map { index -> player.getMediaItemAt(index) }
         } else {
             emptyList()
         }
         // So whatever read-ahead writes for these can be named in the Cached
         // songs folder; its own requests carry nothing but an id.
+        val upcomingSongs = upcomingItems.map { it.toSong() }
         AudioCache.noteSongs(upcomingSongs)
         val preferAudio = AppSettings.preferMusicOnly.value
         val request = preferAudio to upcomingSongs.map { it.videoId }
@@ -5310,24 +5145,29 @@ class PlaybackService : MediaLibraryService() {
         preferredPrefetchRequest = request
         preferredPrefetchJob?.cancel()
 
-        fun warm(songs: List<Song>) {
-            AudioCache.prefetchQueue(
-                songs.map { song ->
-                    // The title, artist and runtime the item was built with —
-                    // see [Song.toMediaItem]. Read from the queued item because
-                    // read-ahead has no other way to reach this metadata.
-                    AudioCache.Upcoming(
-                        mediaId = song.videoId,
-                        target = TrackMatcher.targetOf(song),
-                    )
-                },
+        // The title, artist and runtime the item was built with — see
+        // [Song.toMediaItem]. Read from the queued item because read-ahead has
+        // no other way to reach this metadata. The playback URI rides along
+        // too: a source-backed track is warmed from its own
+        // `bitchord://source` request, which is the only thing that resolves
+        // that recording. See [AudioCache.Upcoming.uri].
+        fun warming(songs: List<Song>, uris: List<Uri?>) = songs.mapIndexed { index, song ->
+            AudioCache.Upcoming(
+                mediaId = song.videoId,
+                target = TrackMatcher.targetOf(song),
+                uri = uris.getOrNull(index),
             )
         }
+
+        fun warm(songs: List<Song>, uris: List<Uri?>) =
+            AudioCache.prefetchQueue(warming(songs, uris))
+
+        fun itemUris(items: List<MediaItem>) = items.map { it.localConfiguration?.uri }
 
         val next = upcomingSongs.firstOrNull()
         if (!preferAudio || next?.isVideo != true) {
             preferredPrefetchJob = null
-            warm(upcomingSongs)
+            warm(upcomingSongs, itemUris(upcomingItems))
             return
         }
 
@@ -5347,7 +5187,11 @@ class PlaybackService : MediaLibraryService() {
                 }
                 .getOrDefault(next)
             if (preferredPrefetchRequest != request) return@launch
-            warm(listOf(preferred) + upcomingSongs.drop(1))
+            val preferredItem = preferred.toMediaItem()
+            warm(
+                listOf(preferred) + upcomingSongs.drop(1),
+                listOf(preferredItem.localConfiguration?.uri) + itemUris(upcomingItems.drop(1)),
+            )
         }
     }
 
@@ -5377,6 +5221,9 @@ class PlaybackService : MediaLibraryService() {
                     lastPositionSeconds = player.currentPosition / 1000
                     player.currentMediaItem?.mediaId?.let {
                         PlaybackTracker.onProgress(it, lastPositionSeconds)
+                        com.music.bitchord.data.spotify.SpotifyScrobbler.onPosition(
+                            player.currentPosition,
+                        )
                     }
                     // The device's own listening record — see [ListeningRecorder],
                     // which counts wall-clock time between ticks rather than

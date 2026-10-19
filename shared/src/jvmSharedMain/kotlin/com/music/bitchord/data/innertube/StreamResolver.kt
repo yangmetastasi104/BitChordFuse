@@ -259,6 +259,7 @@ object StreamResolver {
      * outside the buffer, and each range the cache fills in.
      */
     suspend fun resolve(videoId: String): String {
+        YtmNetwork.requirePlayback()
         init
 
         recent[videoId]
@@ -611,6 +612,7 @@ object StreamResolver {
         maxKbps: Int,
         requireM4a: Boolean = false,
     ): Stream {
+        YtmNetwork.requirePlayback()
         val stream = downloadStream(videoId, maxKbps, requireM4a)
         val allowed = if (requireM4a) setOf("m4a") else setOf("m4a", "webm")
         check(stream.downloadExtension in allowed) {
@@ -721,6 +723,7 @@ object StreamResolver {
      * against a first parse that costs seconds.
      */
     suspend fun signatureTimestamp(videoId: String): Int? {
+        if (YtmNetwork.isPlaybackDisabled()) return null
         cachedSignatureTimestamp?.let { return it }
         return runCatching {
             jsPlayerManager { YoutubeJavaScriptPlayerManager.getSignatureTimestamp(videoId) }

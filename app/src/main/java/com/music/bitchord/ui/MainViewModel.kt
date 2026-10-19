@@ -17,8 +17,9 @@ import com.music.bitchord.data.YtMusicRepository
 import com.music.bitchord.data.model.SPOTIFY_MISSING_PREFIX
 import com.music.bitchord.data.model.SPOTIFY_PENDING_PREFIX
 import com.music.bitchord.data.spotify.SPOTIFY_PAGE_PREFIX
-import com.music.bitchord.data.spotify.SpotifyImporter
 import com.music.bitchord.data.spotify.SpotifyLibrary
+import com.music.bitchord.data.spotify.SpotifyRateLimitedException
+import com.music.bitchord.data.spotify.SpotifySession
 import com.music.bitchord.data.spotify.SpotifyTrack
 import com.music.bitchord.data.lyrics.EmbeddedLyrics
 import com.music.bitchord.data.lyrics.LyricLine
@@ -1603,10 +1604,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         homeSeenTitles.clear()
         _homeLoadingMore.value = false
         _homeRecentlyPlayedLoading.value = _signedIn.value
-        // The core feed plus one browse per supplement. Recently played is left
-        // out: it has its own skeleton at the head of the page rather than the
-        // one at the tail.
-        _homePendingShelves.value = 1 + YtMusicRepository.HOME_SUPPLEMENT_BROWSE_IDS.size
+        // The core feed plus one browse per supplement, plus the Spotify
+        // library section. Recently played is left out: it has its own
+        // skeleton at the head of the page rather than the one at the tail.
+        _homePendingShelves.value =
+            1 + YtMusicRepository.HOME_SUPPLEMENT_BROWSE_IDS.size + 1
         viewModelScope.launch {
             launch {
                 try {
@@ -1650,7 +1652,134 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
+            // The authenticated Spotify library joins the same Home: synced
+            // playlists and Liked Songs as shelves, from the local snapshot
+            // (no network, works offline), plus the live editorial picks.
+            // Each side fails independently — a missing snapshot, a dead
+            // cookie or no network contributes nothing rather than blanking
+            // the YTM feed, and taps route to the existing Spotify detail
+            // pages whose rows resolve through the provider sources at
+            // playback time.
+            launch {
+                try {
+                    val shelves = spotifyHomeShelves()
+                    if (shelves.isNotEmpty() && isCurrentHomeLoad(identity, generation)) {
+                        // Prepended: Spotify leads the feed instead of trailing
+                        // a long YouTube page, where it read as "there is no
+                        // Spotify here at all".
+                        publishHomeShelves(shelves, prepend = true)
+                    }
+                } finally {
+                    homeShelfRequestSettled(identity, generation)
+                }
+            }
         }
+    }
+
+    /**
+     * Spotify shelves for the unified Home: the synced library (snapshot,
+     * offline-safe), the listener's own algorithmic mixes re-sliced from it,
+     * the live editorial picks, plus top songs and recently played. Each side
+     * fails independently — whatever lands gets published.
+     */
+    private suspend fun spotifyHomeShelves(): List<HomeShelf> {
+        // Always leave Spotify a place on Home: a single door card before setup
+        // (which opens the connect screen) rather than a section that silently
+        // is not there and cannot be told apart from a broken integration.
+        if (!AppSettings.spotifyConnected.value) return CatalogMerge.spotifyDoorShelves(connected = false)
+        val cached = SpotifySession.cachedPlaylists()
+        val library = CatalogMerge.spotifyShelves(cached)
+        val madeForYou = CatalogMerge.madeForYouShelves(cached)
+        // Everything above is local: last sync's playlists, Liked Songs and the
+        // algorithmic mixes re-sliced out of them. It costs Spotify nothing, so
+        // it is what Home keeps showing while the live side is refused or
+        // cooling down.
+        val local = library + madeForYou
+        // Live sections are cached for half an hour, and skipped outright
+        // inside Spotify's own Retry-After window: a 429 is a promise that the
+        // next request is refused too, so asking again only spends the window.
+        SpotifySession.cachedHomeLive()?.let { return local + it }
+        if (SpotifySession.retryAfterMs() > 0) {
+            return local.ifEmpty { CatalogMerge.spotifyDoorShelves(connected = true) }
+        }
+        // The bearer minted from the cookie is metered tightly. A live refresh
+        // is four requests at most, each asked exactly once (retries = 1), and
+        // the first 429 ends the whole block: the rest would be refused too,
+        // and waiting the Retry-After out inline is what froze the feed.
+        var refused = false
+        suspend fun <T> live(label: String, block: suspend () -> T): T? {
+            if (refused) return null
+            return try {
+                block()
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is SpotifyRateLimitedException) {
+                    refused = true
+                    SpotifySession.noteRateLimit(e.retryAfterSec)
+                }
+                SpotifySession.noteHomeError("$label: ${e.message ?: e.javaClass.simpleName}")
+                null
+            }
+        }
+        // One request, two shelves: 50 featured playlists split into the picks
+        // shelf and the remainder, where asking once per shelf would have cost
+        // two requests for the same cards.
+        val picks = live("editorial") { SpotifyLibrary.featuredPlaylists(50, retries = 1) }.orEmpty()
+        val editorial = CatalogMerge.editorialShelves(picks.take(20)) +
+            CatalogMerge.playlistShelves("Spotify · More picks", picks.drop(20))
+        // One browse category, not fourteen. The per-category sweep was a
+        // fifteen-request burst on every cold Home and the direct cause of the
+        // 429; the listener's own library and mixes carry the variety instead.
+        val charts = live("charts") { SpotifyLibrary.categoryPlaylists("toplists", 20, retries = 1) }
+            .let { CatalogMerge.playlistShelves("Spotify charts", it.orEmpty()) }
+        // Top songs and recent are resolved to provider rows *here*, so their
+        // cards are playable. Left as `sp:` rows they were un-tappable on Home:
+        // nothing on this screen ever matched them, so every row sat under a
+        // "matching" spinner and a tap did nothing.
+        val top = live("top songs") {
+            resolveSpotifyRows(SpotifyLibrary.topTracks(10, retries = 1))
+        }.let { CatalogMerge.songShelves("Your top songs", it.orEmpty()) }
+        val recent = live("recently played") {
+            resolveSpotifyRows(SpotifyLibrary.recentlyPlayed(10, retries = 1))
+        }.let { CatalogMerge.songShelves("Jump back in", it.orEmpty()) }
+        val liveShelves = editorial + charts + top + recent
+        if (liveShelves.isNotEmpty()) SpotifySession.storeHomeLive(liveShelves)
+        val shelves = local + liveShelves
+        // Connected, but this round produced nothing at all — no synced
+        // snapshot and every live call refused (a 429 evening, a dead token).
+        // Still show the door, so the section is never silently absent and the
+        // reason is one tap away on the Spotify page.
+        return shelves.ifEmpty { CatalogMerge.spotifyDoorShelves(connected = true) }
+    }
+
+    /**
+     * Spotify's tracks turned into **playable** provider rows.
+     *
+     * A `sp:` row cannot be played until it is matched (see
+     * [com.music.bitchord.data.model.isUnresolvedSpotify]) and nothing on Home
+     * ever matched it, so every such card sat under a "matching" spinner and a
+     * tap did nothing. The same [SourceResolver.matchRow] the Spotify detail
+     * pages already run does it here instead, and only the rows that found a
+     * provider copy are kept. Bounded concurrency, so a dozen lookups do not
+     * stampede one source.
+     */
+    private suspend fun resolveSpotifyRows(tracks: List<SpotifyTrack>): List<Song> = coroutineScope {
+        val gate = Semaphore(SPOTIFY_MATCH_PARALLELISM)
+        tracks.map { track ->
+            async {
+                gate.withPermit {
+                    val target = TrackMatcher.Target(
+                        title = track.title,
+                        artist = track.artist,
+                        durationSec = track.durationMs.takeIf { it > 0 }?.div(1000),
+                        album = track.album,
+                    )
+                    val match = runCatching { SourceResolver.matchRow(target) }.getOrNull()
+                    match?.also { SpotifySession.noteResolved(track.id, it.videoId) }
+                        ?.copy(thumbnailUrl = match.thumbnailUrl ?: track.imageUrl)
+                }
+            }
+        }.mapNotNull { it.await() }
     }
 
     /**
@@ -1696,6 +1825,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         recent?.await()?.onSuccess { shelf ->
             if (identity == listenerKey()) shelf?.let { publishHomeShelves(listOf(it), prepend = true) }
         }
+        val spotify = spotifyHomeShelves()
+        if (spotify.isNotEmpty() && identity == listenerKey()) publishHomeShelves(spotify, prepend = true)
     }
 
     /**
@@ -2061,23 +2192,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     return@collectLatest
                 }
 
-                // Search is YouTube's alone. A module is a *substitution*
-                // layer, not a catalogue to browse: it never has cover art,
-                // radio, related tracks or an album page, so its rows arrived
-                // in the results list looking like YouTube's and then behaved
-                // nothing like them. Every track found here takes the ordinary
-                // YouTube path and is handed to the module at playback time —
-                // see [SourceResolver.substituteForYouTube] — which upgrades
-                // the ones it holds without any of them having to be a
-                // separate row to pick between.
-                val result = YtMusicRepository.searchPage(request.query, request.filter)
+                // Unified search: the YouTube Music catalog page plus the
+                // enabled provider sources on the Songs filter, merged with
+                // same-recording duplicates dropped (see [CatalogMerge]).
+                // Other filters are browse-shaped and stay YTM-only.
+                // Each side fails independently: a dead provider server or a
+                // signed-out catalog still leaves the other's rows.
+                val merged: List<SearchResult>
+                var ytmContinuation: String? = null
+                if (request.filter == SearchFilter.SONGS) {
+                    val ytmPage = YtMusicRepository.searchPage(request.query, request.filter).getOrNull()
+                    ytmContinuation = ytmPage?.continuation
+                    val ytmRows = ytmPage?.rows?.filterIsInstance<SearchResult.Track>().orEmpty()
+                    val (providerRows, _) = sourceResults(request.query, request.filter)
+                    merged = CatalogMerge.mergeSongRows(
+                        ytmRows,
+                        providerRows.filterIsInstance<SearchResult.Track>(),
+                    )
+                } else {
+                    val page = YtMusicRepository.searchPage(request.query, request.filter).getOrNull()
+                    ytmContinuation = page?.continuation
+                    merged = page?.rows.orEmpty()
+                }
                 // A search that has been superseded shouldn't land on screen,
                 // whether it succeeded or failed.
                 if (request.requestId != newestRequestId.get()) return@collectLatest
-                _results.value = result.fold(
-                    onSuccess = { page -> published(page, key, request.requestId) },
-                    onFailure = { failure -> UiState.Error(failure.friendly()) },
-                )
+                _results.value = if (merged.isEmpty()) {
+                    UiState.Error(text(R.string.no_results))
+                } else {
+                    // The YTM continuation survives when YTM answered, so
+                    // paging still works; provider rows have no pages.
+                    published(
+                        YtMusicRepository.SearchPage(merged, ytmContinuation),
+                        key,
+                        request.requestId,
+                    )
+                }
             }
     }
 
@@ -2201,21 +2351,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The enabled non-YouTube sources, asked at the same time and returned
-     * split at YouTube's own place in the order.
+     * The enabled provider sources, asked at the same time in registry order.
      *
-     * The split is what makes the Sources screen's ordering visible where it
-     * matters most. A library server ranked above YouTube puts its own copies
-     * at the top of the results — which is the whole point of ranking it there —
-     * and one ranked below appears under them instead.
-     *
+     * This is the search catalogue now that YouTube Music is removed: every
+     * track found here resolves through its own source at playback time.
      * Only the Songs filter fans out: albums, artists and playlists are
      * browse-shaped, and [MusicSource] deliberately answers for tracks only.
      *
      * Asked of the playback list rather than every enabled source, so a result
-     * offered here is one this connection's ceiling would actually let play —
-     * a row that can only be tapped into a YouTube stream is a lie about where
-     * the track is coming from.
+     * offered here is one this connection's ceiling would actually let play.
      */
     private suspend fun sourceResults(
         query: String,
@@ -2223,11 +2367,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     ): Pair<List<SearchResult>, List<SearchResult>> = coroutineScope {
         if (filter != SearchFilter.SONGS) return@coroutineScope emptyList<SearchResult>() to emptyList()
         val active = SourceRegistry.activeForPlayback()
-        val youtubeRank = active.indexOfFirst { it.kind == SourceKind.YOUTUBE }
-            .let { if (it < 0) active.size else it }
 
         val answers = active
-            .filter { it.kind != SourceKind.YOUTUBE }
             .map { source ->
                 source to async {
                     // Per-source, so one slow or unreachable server delays the
@@ -2239,14 +2380,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-        val above = mutableListOf<SearchResult>()
-        val below = mutableListOf<SearchResult>()
-        answers.forEach { (source, job) ->
-            val rows = job.await().map { SearchResult.Track(it) }
-            val rank = active.indexOfFirst { it.configId == source.configId }
-            if (rank in 0 until youtubeRank) above += rows else below += rows
+        val rows = mutableListOf<SearchResult>()
+        answers.forEach { (_, job) ->
+            rows += job.await().map { SearchResult.Track(it) }
         }
-        above to below
+        rows to emptyList()
     }
 
     /**
@@ -2268,16 +2406,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             runCatching {
                 val audio = song
-                // A source-backed row resolves through its own source already
-                // and never takes the YouTube path — warming either half of
-                // this for one would be work nothing asks for.
-                if (SourceRegistry.parseTrackKey(audio.videoId) != null) return@runCatching
-                // JioSaavn first, on the same reasoning as the queue's
-                // read-ahead: it is the copy that will actually be played if it
-                // has the track, so warming YouTube's URL instead warms the one
-                // that loses. Pinned through [StreamChoice] so playback opens
-                // this very stream rather than racing for it again — see
-                // [SourceResolver.prefetchSubstitute], which requires it.
+                // A source-backed row resolves through its own source already.
+                // A bare row is matched against the enabled providers here;
+                // with none matching, the tap path reports "no enabled
+                // source" rather than falling back anywhere.
                 val warmed = SourceResolver.prefetchSubstitute(
                     TrackMatcher.Target(
                         title = audio.title,
@@ -2290,11 +2422,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 if (warmed != null) {
                     StreamChoice.remember(audio.videoId, warmed, substituted = true)
-                    return@runCatching
                 }
-                // Disabled, or hasn't got it: the tap path falls back to
-                // YouTube, so that is what is worth having ready.
-                StreamResolver.resolve(audio.videoId)
             }
         }
     }
@@ -2629,22 +2757,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     if (it.browseId == browseId) it.copy(songs = songs) else it
                 }
             }
-            // The list only had a thumbnail; the full-size cover replaces it
-            // once this page has asked for it.
-            launch {
-                val cover = runCatching { SpotifyLibrary.cover(playlistId) }.getOrNull() ?: return@launch
-                _detailStack.value = _detailStack.value.map {
-                    if (it.browseId == browseId) it.copy(thumbnailUrl = cover) else it
-                }
-            }
+            // The list row already carries the playlist artwork; no separate
+            // cover lookup exists without YouTube Music.
             val tracks = runCatching {
                 SpotifyLibrary.tracks(playlistId) { soFar ->
                     setSongs(UiState.Success(soFar.map { it.asPendingSong() }))
                 }
             }.getOrElse {
-                setSongs(UiState.Error(it.message ?: text(R.string.failed)))
-                return@launch
+                // Offline or failed: fall back to the last synced snapshot so
+                // a synced playlist still opens. An empty cache is a real
+                // error, not a silent empty page.
+                val cached = com.music.bitchord.data.spotify.SpotifySession.cachedTracks(playlistId)
+                if (cached.isEmpty()) {
+                    setSongs(UiState.Error(it.message ?: text(R.string.failed)))
+                    return@launch
+                }
+                setSongs(UiState.Success(cached.map { t -> t.asPendingSong() }))
+                cached
             }
+            // Keep what opening this playlist cost: the snapshot then serves it
+            // offline next time, and a later sync carries it forward instead of
+            // the app re-walking every playlist it owns.
+            SpotifySession.rememberTracks(playlistId, tracks)
             if (tracks.isEmpty()) {
                 setSongs(UiState.Error(text(R.string.spotify_empty_tracks)))
                 return@launch
@@ -2655,7 +2789,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     launch {
                         gate.withPermit {
                             if (!open()) return@withPermit
-                            val match = runCatching { SpotifyImporter.matchTrack(track) }.getOrNull()
+                            val target = TrackMatcher.Target(
+                                title = track.title,
+                                artist = track.artist,
+                                durationSec = track.durationMs.takeIf { it > 0 }?.div(1000),
+                                album = track.album,
+                            )
+                            val match = runCatching { SourceResolver.matchRow(target) }.getOrNull()
+                            // Remember the Spotify identity behind the
+                            // provider row, so the scrobbler can report the
+                            // play even though playback uses the match.
+                            match?.let {
+                                com.music.bitchord.data.spotify.SpotifySession.noteResolved(
+                                    track.id, it.videoId,
+                                )
+                            }
                             val found = match?.copy(thumbnailUrl = match.thumbnailUrl ?: track.imageUrl)
                                 ?: track.asPendingSong().let {
                                     it.copy(videoId = SPOTIFY_MISSING_PREFIX + track.id)

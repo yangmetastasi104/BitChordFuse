@@ -1,19 +1,17 @@
 package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.YtMusicRepository
-import com.music.bitchord.data.innertube.StreamResolver
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.Song
 
 /**
- * YouTube Music, wrapped so it can be ordered alongside everything else.
+ * YouTube Music catalog, wrapped so it can be ordered alongside everything else.
  *
- * A thin adapter over machinery that already exists and stays where it is:
- * [StreamResolver] keeps its client walk, its URL cache and its 403 handling,
- * and nothing about how a YouTube track resolves changes by virtue of this
- * class. What changes is that YouTube is now *one of* the sources rather than
- * the assumption underneath all of them.
+ * Catalog-only: [search] answers from YouTube Music metadata, but this source
+ * never serves audio — [stream] always misses and [capabilities] denies
+ * playback. Playback of any row, including rows found here, resolves through
+ * the enabled add-on/provider sources (see [SourceResolver]).
  *
  * Tracks keep their bare video ids rather than being wrapped in a
  * [SourceRegistry.trackKey]. Half the app knows what a YouTube video id is —
@@ -30,6 +28,20 @@ class YouTubeSource(
     override val kind: SourceKind get() = SourceKind.YOUTUBE
     override val displayName: String get() = config.label.ifBlank { SourceKind.YOUTUBE.label }
 
+    override val capabilities: ProviderCapabilities
+        get() = ProviderCapabilities.ADDON_DEFAULT.copy(
+            search = true,
+            trackMetadata = true,
+            artistInfo = true,
+            albumInfo = true,
+            playlistRetrieval = true,
+            userLibrary = true,
+            discovery = false,
+            playback = false,
+            authentication = true,
+            localFileAccess = false,
+        )
+
     /**
      * Always Ok.
      *
@@ -43,7 +55,7 @@ class YouTubeSource(
     /**
      * [waitForAll] is moot: there is one endpoint here, and it is always waited
      * for. So is [request] — YouTube publishes one set of rows and the tier is
-     * decided per stream, long after this.
+     * decided per stream, long after this. (There is no stream: see [stream].)
      */
     override suspend fun search(
         query: String,
@@ -58,17 +70,9 @@ class YouTubeSource(
             .take(limit)
 
     /**
-     * [request] is not honoured here, and cannot be.
-     *
-     * [StreamRequest.Lossless] has no answer on this source — YouTube publishes
-     * no lossless rendition of anything, which is why [SourceKind.YOUTUBE]
-     * declares `canServeLossless = false` and why [SourceResolver] does not ask
-     * this source for one unless it is the last one left. The bitrate ceiling
-     * is applied inside [StreamResolver] from the same settings, at the point
-     * where the format list is actually in hand.
+     * Always misses: YouTube Music audio resolution is disabled in this
+     * build. A null here is a miss, not an error, and lets [SourceResolver]
+     * move to the next source.
      */
-    override suspend fun stream(trackId: String, request: StreamRequest): SourceStream? {
-        val url = StreamResolver.resolve(trackId)
-        return SourceStream(url = url, format = StreamFormat(codec = "opus"))
-    }
+    override suspend fun stream(trackId: String, request: StreamRequest): SourceStream? = null
 }

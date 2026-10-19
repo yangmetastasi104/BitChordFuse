@@ -3,11 +3,11 @@
 <br/>
 <br/>
 
-<img src="Logo.png" alt="BitChord app icon" width="200" />
+<img src="Logo.png" alt="BitFuse app icon" width="200" />
 
-# BitChord
+# BitFuse
 
-### Aesthetic YouTube Music Client
+### Aesthetic Music Client
 
 <br/>
 
@@ -44,18 +44,17 @@
     <td width="50%" valign="top">
 
 #### Playback
-- **Search, browse and play** anything available on YouTube Music.
-- **Hi-Res lossless audio** — FLAC/ALAC from a configured module source, with YouTube Music as fallback.
+- **Search and play** — one unified Home and search across the YouTube Music catalog, your provider sources, and your Spotify library.
+- **Hi-Res lossless audio** — FLAC/ALAC from a configured module or add-on source. Playback always resolves through your providers; catalogs never supply audio.
 - **Gapless playback with true crossfade**, adjustable 0–12s.
-- **Automix [Beta]** — DJ-style transitions with beat-matching and tempo-stretching.
+- **Automix [Beta]** — DJ-style transitions (falls back to crossfades; beat analysis needs provider audio).
 - **Offline downloads** — save tracks with embedded metadata.
 - **Local music library** integration.
 - **Background playback** via a proper foreground media session.
 - **Apple-like lyrics animation** — credit to [binimum](https://github.com/binimum/am-lyrics).
 
 #### Connectivity & Accounts
-- **Sign in with your Google account** for personalized content.
-- **Spotify integration** — connect your account to play your playlists and Liked Songs.
+- **Spotify integration** — connect your account to sync playlists and Liked Songs (metadata only; playback resolves through your providers).
 - **Discord Rich Presence** — in-app login, live track/artist/album and progress.
 - **Scrobbling** to Last.fm and ListenBrainz.
 - **Pluggable sources** — add, edit, test and health-check module sources.

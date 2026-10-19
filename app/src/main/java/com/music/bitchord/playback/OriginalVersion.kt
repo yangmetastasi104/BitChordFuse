@@ -52,18 +52,14 @@ object OriginalVersion {
             ?: emptySet()
     }
 
-    fun isPinned(videoId: String?): Boolean = videoId != null && videoId in _pinned.value
+    fun isPinned(videoId: String?): Boolean = false
 
-    /** Keeps [videoId] on YouTube's own upload for every play from here on. */
+    /**
+     * No-op in this build: pins kept tracks on YouTube's own upload, and
+     * YouTube Music traffic is disabled. Stored pins from older installs are
+     * ignored (not deleted, so a future build can honour them again).
+     */
     fun pin(videoId: String) {
-        if (videoId.isBlank() || isPinned(videoId)) return
-        var next = _pinned.value + videoId
-        // Oldest first, because the newest entry is the one the listener just
-        // made. A cap at all is only about not carrying a list that grows for
-        // the life of the install; at this size it is not a limit anyone
-        // reverting songs by hand is going to reach.
-        while (next.size > MAX_PINNED) next = next - next.first()
-        write(next)
     }
 
     /** Lets [videoId] be substituted and upgraded again. */

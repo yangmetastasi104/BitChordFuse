@@ -1125,7 +1125,7 @@ object Downloads {
                 )
             }
             if (packaged && AppSettings.exportDownloads.value) {
-                Log.d(TAG, "can't export a .${storable.extension} manifest; taking YouTube for ${track.videoId}")
+                Log.d(TAG, "can't export a .${storable.extension} manifest for ${track.videoId}")
                 return@let
             }
             return Route(
@@ -1146,28 +1146,24 @@ object Downloads {
         // MediaStore.Audio refuses audio/webm on affected Android versions.
         // Keep Opus for app-private downloads, but pin exported downloads to
         // AAC-in-MP4 for both the initial resolve and any mid-transfer retry.
-        val requireM4a = AppSettings.exportDownloads.value
-        val stream = StreamResolver.resolveForDownload(track.videoId, quality.maxKbps, requireM4a)
-        return Route(
-            extension = stream.downloadExtension,
-            mimeType = stream.downloadMimeType,
-            describe = "${stream.kbps}kbps ${stream.mimeType}",
-            downloadFormat = youtubeDownloadBadge(stream.downloadExtension, stream.kbps),
-            write = { sink, onProgress ->
-                Downloader.fetch(track.videoId, stream, quality.maxKbps, requireM4a, sink, onProgress)
-            },
+        //
+        // No YouTube fallback: with YTM traffic disabled there is nowhere for
+        // a provider miss to go. The download fails with a clear error naming
+        // the track instead. (Exported downloads stay AAC-in-MP4 via the
+        // provider stream's own container handling above.)
+        throw java.io.IOException(
+            "No enabled add-on source holds ${track.videoId}; downloads need a configured provider source",
         )
     }
 
     /**
      * The stream to keep for [track] from a configured source, with how to file
-     * it — or null, which is not a failure, just YouTube's turn.
+     * it — or null when no enabled source holds the recording.
      *
      * Usually a bit-exact one; not always. [SourceResolver.forDownload] falls
      * back to the best lossy copy any enabled source holds when nothing has the
-     * recording losslessly, and only gives up on the sources entirely when what
-     * they offer would not beat YouTube's own AAC. Which of those happened is
-     * the resolver's business — from here it is a URL and a codec either way.
+     * recording losslessly. Which of those happened is the resolver's
+     * business — from here it is a URL and a codec either way.
      *
      * Bounded, because a module search waits on every backend it has (see
      * `ModuleSource.SEARCH_PATIENT_MS`) and does that once per query the matcher
@@ -1213,8 +1209,7 @@ object Downloads {
             if (timedOut) {
                 Log.w(
                     TAG,
-                    "source lookup for ${track.videoId} ran past ${SOURCE_LOOKUP_MS}ms; " +
-                        "downloading it from YouTube instead of ${quality.label}",
+                    "source lookup for ${track.videoId} ran past ${SOURCE_LOOKUP_MS}ms",
                 )
             }
             return null
@@ -1222,7 +1217,7 @@ object Downloads {
 
         val storable = DownloadStore.storable(stream.format.codec)
         if (storable == null) {
-            Log.d(TAG, "nothing to file a '${stream.format.codec}' as; taking YouTube for ${track.videoId}")
+            Log.d(TAG, "nothing to file a '${stream.format.codec}' as for ${track.videoId}")
             return null
         }
         return stream to storable

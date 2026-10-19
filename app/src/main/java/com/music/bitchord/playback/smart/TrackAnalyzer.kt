@@ -303,7 +303,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             emptyList()
         } else {
             cache.renditionsOf(analysisUri)
-                .filter { AutomixAnalysisSource.isCanonicalYouTubeRendition(analysisUri.getQueryParameter("v"), it.key) }
+                .filter { isAnalyzableRendition(analysisUri.getQueryParameter("v"), it.key) }
                 .filter { it.isComplete && it.key !in badRenditions }
         }
         val usableComplete = local || complete.isNotEmpty()
@@ -496,7 +496,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // minutes earlier reported zero here, because the question was being
         // asked of the wrong copy of it.
         val candidate = cache.renditionsOf(uri)
-            .filter { AutomixAnalysisSource.isCanonicalYouTubeRendition(uri.getQueryParameter("v"), it.key) }
+            .filter { isAnalyzableRendition(uri.getQueryParameter("v"), it.key) }
             .filter { it.cachedPrefix > 0L && it.key !in badRenditions }
             // The growth guard, applied as a filter rather than to the winner.
             // Applied afterwards it did not skip a copy, it ended the search: the
@@ -714,7 +714,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         durationSeconds: Double,
     ): AudioCache.Rendition? {
         val complete = cache.renditionsOf(uri)
-            .filter { AutomixAnalysisSource.isCanonicalYouTubeRendition(uri.getQueryParameter("v"), it.key) }
+            .filter { isAnalyzableRendition(uri.getQueryParameter("v"), it.key) }
             .filter { it.isComplete && it.key !in badRenditions }
         if (complete.isEmpty()) return null
 
@@ -811,12 +811,27 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     }
 
     /**
+     * Which renditions Automix may measure — see
+     * [AutomixAnalysisSource.isAnalyzableRendition], which owns the rule. The
+     * duration cross-check at the call sites still guards against measuring a
+     * different cut of the song.
+     */
+    private fun isAnalyzableRendition(
+        videoId: String?,
+        cacheKey: String,
+    ): Boolean = AutomixAnalysisSource.isAnalyzableRendition(videoId, cacheKey)
+
+    /**
      * Source-backed playback URIs (JioSaavn, module/lossless, etc.) carry the
      * same title/artist/runtime matching hints as a YouTube item. Resolve that
      * identity once, then keep playback on its original URI while analysis
      * fills and reads the separately pinned YouTube Opus entry.
      */
     private fun analysisUriFor(trackId: String, playbackUri: Uri): Uri? {
+        // Without YouTube audio there is no separate Opus copy to pin:
+        // analysis measures the playback URI's own cached renditions (see
+        // [isAnalyzableRendition]) instead of mapping to one.
+        if (!AutomixAnalysisSource.youtubeOpusEnabled) return playbackUri
         if (playbackUri.getQueryParameter("v") != null || playbackUri.authority != "source") return playbackUri
         sourceAnalysisUris[trackId]?.let { return it }
         if (trackId in sourceResolutionAttempted) return null
@@ -843,6 +858,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private suspend fun findYouTubeMatch(target: TrackMatcher.Target): com.music.bitchord.data.model.Song? {
         if (target.title.isBlank()) return null
+        // When YouTube Music is disabled (no YouTube Opus available), fall back to
+        // matching against enabled provider sources instead of YouTube Music search.
+        if (!AutomixAnalysisSource.youtubeOpusEnabled) {
+            return SourceResolver.matchRow(target)
+        }
         for (query in TrackMatcher.queries(target)) {
             val candidates = YtMusicRepository.search(query, SearchFilter.SONGS)
                 .getOrNull()

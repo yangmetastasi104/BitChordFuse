@@ -1,5 +1,6 @@
 package com.music.bitchord.data.lyrics
 
+import com.music.bitchord.data.innertube.YtmNetwork
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -191,6 +192,14 @@ object LyricsRepository {
         /** Fetches a document once per lookup, however many sources want it. */
         get: suspend (String) -> String?,
     ): List<LyricLine>? {
+        // YouTube Music lyrics and transcripts need youtubei. With YTM
+        // traffic switched off (Android) they are skipped before any request;
+        // other platforms are unaffected.
+        if (YtmNetwork.isCatalogDisabled() &&
+            (source == LyricsSource.YOUTUBE_TRANSCRIPT || source == LyricsSource.YOUTUBE_MUSIC)
+        ) {
+            return null
+        }
         val found = when (source) {
             LyricsSource.LRC_RED -> LrcRed.lyrics(title, artist, durationMs, isrc, get)
             LyricsSource.BETTER_LYRICS -> BetterLyrics.lyrics(title, artist, durationMs, album)

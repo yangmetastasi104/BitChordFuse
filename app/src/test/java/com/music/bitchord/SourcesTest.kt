@@ -603,7 +603,35 @@ class SourcesTest {
         val sources = SourceRegistry.sourcesForInit(emptyList(), forceJioSaavnOff = true)
 
         assertFalse(sources.single { it.kind == SourceKind.JIOSAAVN }.enabled)
-        assertTrue(sources.single { it.kind == SourceKind.YOUTUBE }.enabled)
+    }
+
+    @Test
+    fun `YouTube Music catalog is seeded for metadata`() {
+        val stored = listOf(
+            SourceConfig(kind = SourceKind.ADDON, baseUrl = "https://addon.example"),
+        )
+        val sources = SourceRegistry.sourcesForInit(stored, forceJioSaavnOff = true)
+
+        // Seeded for catalog (search/home/library) — but it must never
+        // appear in the playback or download walks.
+        assertTrue(sources.any { it.kind == SourceKind.YOUTUBE })
+    }
+
+    @Test
+    fun `catalog source is excluded from playback and download walks`() {
+        val before = SourceRegistry.configs.value
+        try {
+            // add() publishes (rebuilds instances); a raw value assignment
+            // would leave the instance map stale.
+            SourceRegistry.add(SourceConfig(kind = SourceKind.ADDON, baseUrl = "https://addon.example", enabled = true))
+            SourceRegistry.add(SourceConfig(kind = SourceKind.JIOSAAVN, enabled = true))
+            SourceRegistry.add(SourceConfig(kind = SourceKind.YOUTUBE, enabled = true))
+            assertTrue(SourceRegistry.activeForPlayback().none { it.kind == SourceKind.YOUTUBE })
+            assertTrue(SourceRegistry.activeForDownload().none { it.kind == SourceKind.YOUTUBE })
+            assertTrue(SourceRegistry.activeForCatalog().any { it.kind == SourceKind.YOUTUBE })
+        } finally {
+            SourceRegistry.configs.value = before
+        }
     }
 
     @Test
@@ -1067,28 +1095,19 @@ class SourcesTest {
         assertNull(TrackMatcher.best(emptyList(), target))
     }
 
-    // ---- What a lossy source has to beat to become a file -------------------
+    // ---- What a lossy source has to state to become a file -------------------
 
     /**
-     * The case the floor exists for: JioSaavn's top rendition is better than
-     * anything YouTube's AAC ladder holds, so a download takes it rather than
-     * filing a copy worse than the one that would have been streamed.
+     * With YouTube Music removed, any stated bitrate is worth filing: the
+     * provider copy is the only copy. JioSaavn's 320 and a module's 128 both
+     * clear a bar YouTube's ladder no longer sets.
      */
     @Test
-    fun `a 320 from a source is worth keeping over youtube's aac`() {
-        assertTrue(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4", kbps = 320)))
-    }
-
-    /**
-     * Below the top of YouTube's own ladder, a source's copy is trading one
-     * lossy file for another and giving up the more reliable fetch to do it —
-     * including at 256, where the two are a wash and the tie goes to YouTube.
-     */
-    @Test
-    fun `a thinner rendition loses to youtube's aac`() {
-        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp3", kbps = 128)))
-        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4", kbps = 160)))
-        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "aac", kbps = 256)))
+    fun `a stated rendition is worth keeping as a file`() {
+        assertTrue(SourceResolver.statesDownloadableBitrate(StreamFormat(codec = "mp4", kbps = 320)))
+        assertTrue(SourceResolver.statesDownloadableBitrate(StreamFormat(codec = "mp3", kbps = 128)))
+        assertTrue(SourceResolver.statesDownloadableBitrate(StreamFormat(codec = "mp4", kbps = 160)))
+        assertTrue(SourceResolver.statesDownloadableBitrate(StreamFormat(codec = "aac", kbps = 256)))
     }
 
     /**
@@ -1098,8 +1117,8 @@ class SourcesTest {
      */
     @Test
     fun `an unstated rendition is not worth keeping`() {
-        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat()))
-        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4")))
+        assertFalse(SourceResolver.statesDownloadableBitrate(StreamFormat()))
+        assertFalse(SourceResolver.statesDownloadableBitrate(StreamFormat(codec = "mp4")))
     }
 
     // ---- Which sources are worth asking before a track is played ------------

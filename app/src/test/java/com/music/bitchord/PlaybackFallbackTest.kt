@@ -1,7 +1,6 @@
 package com.music.bitchord
 
 import com.music.bitchord.playback.PlaybackFallback
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -59,15 +58,25 @@ class PlaybackFallbackTest {
     }
 
     @Test
-    fun `source fallback removes manifest and upgrade markers and gets its own rendition`() {
-        val failed =
-            "bitchord://source?s=addon-1&t=3919244&n=Bin%20Tere&a=Vishal%20%26%20Shekhar" +
-                "&manifest_reopen=dash&q=hifi#part"
+    fun `source failure marker is still recognised as an alternative`() {
+        assertTrue(
+            PlaybackFallback.isAlternative(
+                "bitchord://source?s=addon-1&t=3919244&n=Bin%20Tere&a=Vishal%20%26%20Shekhar" +
+                    "&manifest_reopen=dash&q=hifi#part",
+                substitutedYouTube = false,
+            ),
+        )
+    }
 
-        assertEquals(
-            "bitchord://source?s=addon-1&t=3919244&n=Bin%20Tere&a=Vishal%20%26%20Shekhar" +
-                "&direct_youtube=1&q=original#part",
-            PlaybackFallback.directYouTubeSourceUri(failed),
+    @Test
+    fun `legacy direct youtube marker never falls back recursively`() {
+        // Queues from before the YouTube Music removal may still carry the
+        // marker; it must not trigger any fallback construction.
+        assertFalse(
+            PlaybackFallback.isAlternative(
+                "bitchord://source?s=addon-1&t=3919244&n=Bin%20Tere&direct_youtube=1&q=original#part",
+                substitutedYouTube = false,
+            ),
         )
     }
 }
